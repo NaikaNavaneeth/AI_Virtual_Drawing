@@ -101,13 +101,16 @@ This makes the model invariant to hand position and scale.
 
 ## 2D Drawing Controls
 
-| Gesture | Action |
-|---|---|
-| Index finger up | Draw |
-| Index + middle | Erase |
-| Open palm (hold) | Clear canvas |
-| Index hover over palette | Select color |
-| Lift finger after stroke | AI shape snap |
+### Immediate Gesture-Based System (v3.0)
+
+| Gesture | Action | Start | Stop |
+|---|---|---|---|
+| Index finger up | Draw | **IMMEDIATE** ⚡ | Switch gesture |
+| Index + middle | Erase | IMMEDIATE | Switch gesture |
+| Open palm (brief) | Clear canvas | Quick tap | (Auto) |
+| Fist / Other | Idle/Safe | N/A | Stops drawing |
+| Index hover over palette | Select color | Tap | (Auto) |
+| Draw + pause 1s | AI shape snap | (Optional) | Manual + switch |
 
 | Key | Action |
 |---|---|

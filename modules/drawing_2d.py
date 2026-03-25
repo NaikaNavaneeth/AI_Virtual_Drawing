@@ -321,17 +321,6 @@ class DrawingState:
         self._last_gesture: Dict[int, str] = {}    # hand_id -> previous gesture
         # FIX-13: Reduce confirmation from 4→2 for faster stop detection (~65ms)
         self._STOP_CONFIRMATION_FRAMES = 2
-        
-        # FIX-14: Timing-based draw start/stop (2-3 second delays)
-        # Track when gesture transitions to "draw" for each hand
-        self._gesture_time: Dict[int, float] = {}  # hand_id -> time gesture started
-        # Track hand position to detect idle state during drawing
-        self._last_draw_pos: Dict[int, Tuple[int, int]] = {}  # hand_id -> (x, y)
-        self._last_movement_time: Dict[int, float] = {}  # hand_id -> timestamp of last movement
-        # Require 2 seconds of "draw" gesture before actually starting (120 frames @ 30fps)
-        self._DRAW_START_DELAY = 2.0
-        # Auto-stop after 2.5 seconds of hand idle while in draw gesture
-        self._DRAW_IDLE_TIMEOUT = 2.5
 
     def push_undo(self):
         if len(self.undo_stack) >= UNDO_LIMIT:
@@ -966,35 +955,10 @@ def run(use_voice: bool = True):
 
                 gesture = gesture_filter.filter(gesture)
                 gesture_this_frame = gesture
-                
-                # FIX-14: Timing-based gesture confirmation (2-3 second delays)
-                # Require 2 seconds of "draw" gesture before starting
-                # Auto-stop after 2.5 seconds of hand idle during drawing
-                last_gest = ds._last_gesture.get(hi, "idle")
-                
-                if gesture != last_gest:
-                    # Gesture changed - start timing
-                    ds._gesture_time[hi] = now
-                    ds._last_gesture[hi] = gesture
-                    # FIX-14 FIX: Initialize movement time when transitioning to draw
-                    # NOTE: ix, iy defined later at line ~1003, so actual init deferred to gesture handling
-                    # Immediately accept non-draw gestures (stop)
-                    confirmed_gesture = gesture if gesture != "draw" else last_gest
-                else:
-                    gesture_elapsed = now - ds._gesture_time.get(hi, now)
-                    
-                    if gesture == "draw":
-                        # Require 2 second hold before accepting draw
-                        if gesture_elapsed >= ds._DRAW_START_DELAY:
-                            confirmed_gesture = "draw"
-                        else:
-                            # Still waiting for 2 second threshold
-                            confirmed_gesture = last_gest
-                    else:
-                        # Non-draw gestures apply immediately
-                        confirmed_gesture = gesture
-                
-                gesture = confirmed_gesture
+                # FIX-15: IMMEDIATE gesture-based start/stop (removed 2-3 second timing delays)
+                # Draw starts immediately when "draw" gesture detected
+                # Draw stops immediately when gesture changes away from "draw"
+                # This provides much better UX - users can start/stop drawing instantly
 
                 if training_mode and collector:
                     training_count = collector.record(lm)
@@ -1057,45 +1021,16 @@ def run(use_voice: bool = True):
                     ds.pause_snapped[hi]    = False
                     ds._skip_first_draw[hi] = False
 
-                # FIX-13: HARD STOP - block drawing if not in draw gesture
+                # FIX-15: HARD STOP - block drawing if not in draw gesture
                 if gesture != "draw":
                     ds.prev_x = None
                     ds.prev_y = None
-                    # Clean up timing state for non-draw gestures
-                    ds._last_movement_time.pop(hi, None)
-                    ds._last_draw_pos.pop(hi, None)
 
                 # ── Draw ─────────────────────────────────────────────────────
                 elif gesture == "draw":
-                    # FIX-14 FIX: Initialize movement tracking on gesture transition to draw
-                    if gesture != last_gest:
-                        ds._last_movement_time[hi] = now
-                        ds._last_draw_pos[hi] = (ix, iy)
-                    
-                    # FIX-14: Check for idle timeout (auto-stop after 2.5 seconds of no movement)
-                    # Only check timeout if user is actually drawing (was_prev = True) and  
-                    # drawing has started (not during 2-second startup delay)
-                    if was_prev:
-                        last_pos = ds._last_draw_pos.get(hi, (ix, iy))
-                        move_dist = abs(ix - last_pos[0]) + abs(iy - last_pos[1])
-                        
-                        if move_dist > 3:  # Movement threshold (>3 pixels)
-                            # Hand moved - reset idle timer
-                            ds._last_movement_time[hi] = now
-                            ds._last_draw_pos[hi] = (ix, iy)
-                        else:
-                            # Hand idle - check timeout
-                            idle_time = now - ds._last_movement_time.get(hi, now)
-                            if idle_time >= ds._DRAW_IDLE_TIMEOUT:
-                                # FIX-14: Auto-stop after idle timeout
-                                ds.try_snap_shape(collab)
-                                ds.was_drawing[hi] = False
-                                ds._draw_start_pos.pop(hi, None)
-                                ds._last_movement_time.pop(hi, None)
-                                ds._last_draw_pos.pop(hi, None)
-                                ds.reset_stroke()
-                                ds.clear_hold = 0
-                                ds.pause_snapped[hi] = False
+                    # FIX-15: Immediate gesture-based drawing (no timing delays)
+                    # Draw starts immediately when "draw" gesture is detected
+                    # No need for idle timeout - user controls drawing with gesture transitions
                     
                     if iy > UI_H:
                         # FIX-13: Skip first frame after position reset (hard stop)
@@ -1177,11 +1112,6 @@ def run(use_voice: bool = True):
             for hi in list(ds._gesture_frames.keys()):
                 ds._gesture_frames.pop(hi, None)
                 ds._last_gesture.pop(hi, None)
-            # FIX-14: Clean up timing state for lost hands
-            for hi in list(ds._gesture_time.keys()):
-                ds._gesture_time.pop(hi, None)
-                ds._last_movement_time.pop(hi, None)
-                ds._last_draw_pos.pop(hi, None)
             ds.reset_stroke()
             ds.clear_hold = 0
 
