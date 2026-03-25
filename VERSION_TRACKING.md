@@ -388,6 +388,19 @@ python train_gesture_cnn.py --eval   # Test accuracy on synthetic data
 
 ---
 
+## 2026-03-25: Bugfixes & Pipeline Hardening
+
+Stability and correctness fixes applied across the ML → inference → snap pipeline:
+
+- `ml/gesture_cnn.py`: guard against invalid/degenerate landmark vectors (`landmarks_to_vector()` returning `None`) to prevent runtime crashes; in-app training now skips invalid samples.
+- `ml/gesture_cnn.py`: augmentation now re-normalizes landmark vectors to match inference preprocessing (max-abs scaling), reducing feature-distribution drift.
+- `ml/gesture_cnn.py`: synthetic gesture generator now makes `pinch` distinct from `fist` by forcing thumb/index tip proximity; improves learnability of the 9 gesture classes.
+- `modules/drawing_2d.py`: temporal gesture smoothing is now confidence-weighted rather than plain majority voting.
+- `modules/drawing_2d.py`: shape snap erase now uses black fill to avoid leaving “white box” artifacts.
+- `modules/drawing_2d.py`: letter/digit snap is now functional via lightweight glyph template matching (A–Z, 0–9).
+- `modules/drawing_2d.py`: fixed an off-by-one padding bug in `_snap_to_letter` that could crash the 2D module.
+- `ml/drawing_cnn.py`: fixed a runtime issue by adding the missing `numpy` import.
+
 **Last Updated**: September 6, 2024  
 **Next Review**: After 1 week of production usage
 

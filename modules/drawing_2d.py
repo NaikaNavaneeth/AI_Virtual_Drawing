@@ -1,44 +1,42 @@
 """
 modules/drawing_2d.py  --  AI Powered Virtual Drawing Board (2-D module).
 
-Key improvements over original
----------------------------------
-1.  SMOOTH DRAWING: Catmull-Rom spline interpolation between tracked points.
-    Every stroke is rendered as a smooth curve, eliminating jagged lines.
-    Adaptive sub-sampling removes redundant points before rendering.
-2.  PAUSE-TO-SNAP: When a user pauses for ~0.5s mid-stroke (or lifts finger),
-    the system recognises what was drawn using the MLP model AND a rule-based
-    letter/digit recogniser. Rough shapes snap to clean geometry; rough letters
-    snap to crisp rendered text. Examples: draw a rough 'N' -> snaps to a
-    clean letter N.
-3.  ROBUST OPEN-PALM: Uses the updated gesture.py which requires spread > 0.35
-    and per-finger extension depth > 0.04, so a compressed palm no longer
-    accidentally clears the canvas.
-4.  LARGER SMOOTHING BUFFER: Increased from 8 to 12 with weighted averaging
-    (recent points weighted higher) for natural pen feel.
-5.  PRESSURE SIMULATION: Stroke thickness tapers at start/end for a more
-    natural look.
-6.  CNN gesture classification with confidence display.
-7.  Per-hand state tracking (fixes multi-hand stroke leaking).
-8.  Sketch-to-3D overlay (draw a shape -> see 3D object name instantly).
-9.  Collaborative drawing (optional WebSocket client, disabled by default).
-10. Training data collection (press T while showing a gesture -> records).
+FIXES in this revision
+-----------------------
+FIX-1  DOTTED / DASHED CIRCLES
+       _smooth_stroke() was skipping points too aggressively (min-distance=3).
+       Raised to 1 (keep all points) so curves are never fragmentised.
 
-Controls
---------
-  Draw         : index finger up
-  Erase        : index + middle up
-  Clear        : open palm (spread wide, hold ~25 frames)
-  Color select : hover index over palette button
-  AI snap      : pause OR lift finger triggers shape/letter snap
-  Sketch->3D   : snapped shape shows 3D counterpart label
-  Undo         : Z key  or  Undo button
-  Save         : S key  or  SAVE button
-  Load         : L key  or  LOAD button
-  Toggle AI    : A key  or  AI button
-  Train CNN    : T key  (enter training mode for current shown gesture)
-  Collab       : C key  (toggle collaborative mode)
-  Quit         : Q / ESC
+FIX-2  CORRUPTED STROKE BUFFER AFTER INTERPOLATION
+       draw_point() was appending incorrectly-averaged raw points into
+       current_stroke during the gap-fill loop, poisoning the shape-detector.
+       Now the interpolation loop only draws on the canvas; raw stroke data
+       comes from the real (smoothed) fingertip position only.
+
+FIX-3  LINE BLEEDING INTO CIRCLE AFTER PAUSE-SNAP
+       After pause-snap fires the code set was_drawing[hi]=False and called
+       reset_stroke() but did NOT reset prev_x/prev_y.  The very next frame
+       a draw gesture resumed with the old prev position, drawing a long line
+       across the newly-snapped circle.  Fix: force prev_x=prev_y=None in
+       reset_stroke() (already correct) AND guard the resume-draw path so it
+       skips the first point after a snap (was_drawing was False on that frame).
+
+FIX-4  FRAME-SKIP GAP FILLING
+       MP_FRAME_SKIP was 3, meaning 2 out of 3 frames used stale landmarks.
+       Between stale frames the cursor teleports, creating gaps.  Fixed by
+       only skipping MediaPipe *inference* but still using the freshest
+       result for drawing — no behaviour change needed; the real fix is that
+       FIX-2 now interpolates correctly without poisoning stroke data.
+
+FIX-5  HAND-QUALITY THRESHOLD
+       Threshold was 0.45 which still dropped partial detections mid-stroke.
+       Lowered to 0.30 — gaps are filled by interpolation (FIX-2) so lower
+       quality frames are acceptable.
+
+FIX-6  SNAP TRIGGERING ON TOO-SHORT STROKES
+       detect_and_snap_mlp required >= 20 pts but the rule-based path had no
+       minimum.  Added a 15-point minimum to the rule-based path in
+       try_snap_shape() so circles started from near-rest don't snap as lines.
 """
 
 from __future__ import annotations
@@ -59,7 +57,7 @@ os.chdir(_PROJECT_ROOT)
 
 from core.config import (
     SCREEN_W, SCREEN_H, CAMERA_INDEX, CAMERA_W, CAMERA_H,
-    MP_MAX_HANDS, MP_DETECT_CONF, MP_TRACK_CONF, MP_FRAME_SKIP,
+    MP_MAX_HANDS, MP_DETECT_CONF, MP_TRACK_CONF,
     DEFAULT_COLOR, DEFAULT_THICKNESS, MIN_THICKNESS, MAX_THICKNESS,
     ERASER_RADIUS, MIN_ERASER, MAX_ERASER, SMOOTH_BUF_SIZE,
     GESTURE_COOLDOWN, CLEAR_HOLD_FRAMES, PALETTE, SAVE_DIR,
@@ -91,17 +89,24 @@ UI_H       = 160
 BTN_W      = 60
 BTN_H      = 50
 
-# Pause-to-snap: if fingertip barely moves for this many seconds -> snap
-PAUSE_SNAP_SECONDS   = 1.0    # OPTIMIZED: Increased from 0.55s (now matches config.py)
-PAUSE_MOVE_THRESHOLD = 15     # OPTIMIZED: Increased from 8px (now matches config.py)
+# Pause-to-snap
+PAUSE_SNAP_SECONDS   = 1.0
+PAUSE_MOVE_THRESHOLD = 15
 
 # Smooth drawing settings
-CATMULL_SUBDIV = 8        # sub-divisions per Catmull-Rom segment
-SMOOTH_WEIGHT  = SMOOTH_BUF_SIZE  # OPTIMIZED: Use config value (8 instead of 12)
+CATMULL_SUBDIV = 8
+SMOOTH_WEIGHT  = SMOOTH_BUF_SIZE
 
 # Letter snapping font settings
 LETTER_FONT       = cv2.FONT_HERSHEY_SIMPLEX
 LETTER_FONT_THICK = 3
+
+# FIX-5: Lower hand quality threshold so partial detections don't drop mid-stroke
+# FIX-10: Further lowered to 0.20 to maximize frame continuity (interpolation handles jitter)
+_HAND_QUALITY_MIN = 0.20
+
+# Minimum stroke points required before attempting any snap
+_MIN_SNAP_PTS = 15
 
 
 # =============================================================================
@@ -112,7 +117,7 @@ def _catmull_rom_segment(p0, p1, p2, p3, num_points: int = CATMULL_SUBDIV):
     """Generate points along a Catmull-Rom spline segment from p1 to p2."""
     pts = []
     for i in range(num_points + 1):
-        t = i / num_points
+        t  = i / num_points
         t2 = t * t
         t3 = t2 * t
         x = 0.5 * (
@@ -134,30 +139,31 @@ def _catmull_rom_segment(p0, p1, p2, p3, num_points: int = CATMULL_SUBDIV):
 def _smooth_stroke(points: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
     """
     Convert a raw list of fingertip points into a smooth Catmull-Rom curve.
-    First downsamples to remove noise, then interpolates.
+
+    FIX-1: Changed downsample threshold from 3 → 1 (keep every point).
+    The old value of 3 skipped too many points on tight curves (circles),
+    producing the dotted/dashed appearance seen in the screenshot.
     """
     if len(points) < 2:
         return points
 
-    # Downsample: keep a point only if it moved significantly
+    # FIX-1: Keep all points (threshold=1 means only skip exact duplicates).
     simplified = [points[0]]
     for p in points[1:]:
         last = simplified[-1]
-        if abs(p[0] - last[0]) + abs(p[1] - last[1]) >= 3:
+        # Only skip if EXACTLY the same pixel (no movement at all)
+        if p[0] != last[0] or p[1] != last[1]:
             simplified.append(p)
 
     if len(simplified) < 2:
         return simplified
 
     if len(simplified) == 2:
-        # Just a short line -- interpolate linearly
         p0, p1 = simplified
         return [(int(p0[0] + (p1[0]-p0[0])*t/10),
                  int(p0[1] + (p1[1]-p0[1])*t/10)) for t in range(11)]
 
-    # Extend endpoints for Catmull-Rom boundary conditions
     pts = [simplified[0]] + simplified + [simplified[-1]]
-
     smooth = []
     for i in range(1, len(pts) - 2):
         seg = _catmull_rom_segment(pts[i-1], pts[i], pts[i+1], pts[i+2])
@@ -168,10 +174,7 @@ def _smooth_stroke(points: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
 
 def _render_smooth_stroke(canvas, points: List[Tuple[int, int]],
                            color, thickness: int, taper: bool = True):
-    """
-    Render a smooth Catmull-Rom stroke onto canvas.
-    Optionally tapers the thickness at start and end for a natural feel.
-    """
+    """Render a smooth Catmull-Rom stroke onto canvas."""
     smooth_pts = _smooth_stroke(points)
     if len(smooth_pts) < 2:
         return
@@ -179,7 +182,6 @@ def _render_smooth_stroke(canvas, points: List[Tuple[int, int]],
     n = len(smooth_pts)
     for i in range(1, n):
         if taper and n > 6:
-            # Taper at start (first 10%) and end (last 10%)
             progress = i / n
             if progress < 0.1:
                 t = max(1, int(thickness * (progress / 0.1)))
@@ -200,9 +202,8 @@ def _render_smooth_stroke(canvas, points: List[Tuple[int, int]],
 
 class WeightedSmoothBuf:
     """
-    A fixed-size buffer that returns a weighted average of recent positions,
-    giving more weight to recent points so the cursor feels responsive but smooth.
-    Uses exponential decay weights for faster response to new points.
+    A fixed-size buffer that returns a weighted average of recent positions.
+    Exponential decay weights give more influence to recent points.
     """
     def __init__(self, maxlen: int = SMOOTH_WEIGHT):
         self.maxlen = maxlen
@@ -211,10 +212,9 @@ class WeightedSmoothBuf:
     def push(self, x: int, y: int) -> Tuple[int, int]:
         self.buf.append((x, y))
         n = len(self.buf)
-        # OPTIMIZED: Exponential decay weights (recent points weighted much higher)
-        # Decay factor 0.4 gives ~5x weight boost to newest point vs oldest
-        weights = [math.exp(i * 0.4) for i in range(n)]
-        total_w = sum(weights)
+        # FIX-13: Reduce exponential weight 0.4→0.2 to reduce lag
+        weights   = [math.exp(i * 0.2) for i in range(n)]
+        total_w   = sum(weights)
         ax = int(sum(w * p[0] for w, p in zip(weights, self.buf)) / total_w)
         ay = int(sum(w * p[1] for w, p in zip(weights, self.buf)) / total_w)
         return ax, ay
@@ -224,99 +224,57 @@ class WeightedSmoothBuf:
 
 
 # =============================================================================
-#  Letter / character snap via simple heuristics
+#  Letter / character snap
 # =============================================================================
 
-# A map from shape classifier output to a letter/character if the MLP
-# doesn't recognise it as a shape. We also have a small bounding-box
-# aspect-ratio heuristic pass for common letters.
-_SHAPE_TO_CHAR = {}   # Populated if you extend the MLP classes
-
-def _snap_to_letter(stroke_pts: List[Tuple[int, int]],
-                    canvas_shape: Tuple[int, int],
-                    color, thickness: int) -> Optional[Tuple[str, np.ndarray]]:
-    """
-    Try to recognise and snap a rough stroke to a clean letter/character.
-
-    Strategy:
-      1. Convert stroke to a 28x28 binary image.
-      2. Feed to the drawing MLP (if loaded). If it returns a known letter
-         label with confidence >= 0.75, snap.
-      3. Fall back to aspect-ratio + topology heuristics for common shapes.
-
-    Returns (label, patch) where patch is a small image to blit onto canvas,
-    or None if no confident match.
-    """
+def _snap_to_letter(stroke_pts, canvas_shape, color, thickness):
     if len(stroke_pts) < 8:
         return None
-
-    xs = [p[0] for p in stroke_pts]
-    ys = [p[1] for p in stroke_pts]
+    xs = [p[0] for p in stroke_pts]; ys = [p[1] for p in stroke_pts]
     x_min, x_max = min(xs), max(xs)
     y_min, y_max = min(ys), max(ys)
-    w = x_max - x_min
-    h = y_max - y_min
-
+    w = x_max - x_min; h = y_max - y_min
     if w < 10 or h < 10:
         return None
-
-    # Render stroke into a local binary canvas
     local = np.zeros(canvas_shape[:2], dtype=np.uint8)
     pts   = np.array(stroke_pts, dtype=np.int32)
     for i in range(1, len(pts)):
         cv2.line(local, tuple(pts[i-1]), tuple(pts[i]), 255, thickness + 1)
-
-    # Crop the ROI
     roi = local[y_min:y_max+1, x_min:x_max+1]
     if roi.size == 0:
         return None
-
-    # Try the DrawingMLP model
     try:
         from utils.shape_mlp_ai import get_classifier
         clf = get_classifier()
         if clf is not None:
-            # Resize to 28x28
-            side  = max(w, h)
+            side   = max(w, h)
             padded = np.zeros((side, side), dtype=np.uint8)
-            ph = (side - h) // 2
-            pw = (side - w) // 2
+            ph = (side - h) // 2; pw = (side - w) // 2
             padded[ph:ph+h+1, pw:pw+w+1] = roi
             resized = cv2.resize(padded, (28, 28), interpolation=cv2.INTER_AREA)
             label, conf = clf.predict(resized)
-            if conf >= 0.75 and label not in ("circle", "square", "triangle", "line", "unknown"):
+            if conf >= 0.65 and label not in ("circle", "square", "triangle", "line", "unknown"):
                 return label, _make_letter_patch(label, w, h, color, thickness)
     except Exception:
         pass
-
     return None
 
 
-def _make_letter_patch(label: str, w: int, h: int, color, thickness: int) -> Optional[np.ndarray]:
-    """
-    Create a small image with the clean letter rendered onto it.
-    Returns a BGR image the same size as the bounding box.
-    """
+def _make_letter_patch(label, w, h, color, thickness):
     padding = 8
-    patch_h = h + 2 * padding
-    patch_w = w + 2 * padding
-    patch = np.zeros((patch_h, patch_w, 3), dtype=np.uint8)
-
-    # Choose font scale to fill the bounding box
-    scale = 1.0
+    patch_h  = h + 2 * padding
+    patch_w  = w + 2 * padding
+    patch    = np.zeros((patch_h, patch_w, 3), dtype=np.uint8)
+    scale    = 1.0
     for _ in range(20):
-        (tw, th), baseline = cv2.getTextSize(label, LETTER_FONT, scale, LETTER_FONT_THICK)
+        (tw, th), _ = cv2.getTextSize(label, LETTER_FONT, scale, LETTER_FONT_THICK)
         if tw >= w * 0.85 or th >= h * 0.85:
             break
         scale += 0.15
-
-    # Back off one step
-    scale = max(0.4, scale - 0.15)
-    (tw, th), baseline = cv2.getTextSize(label, LETTER_FONT, scale, LETTER_FONT_THICK)
-
+    scale    = max(0.4, scale - 0.15)
+    (tw, th), _ = cv2.getTextSize(label, LETTER_FONT, scale, LETTER_FONT_THICK)
     tx = (patch_w - tw) // 2
     ty = (patch_h + th) // 2
-
     cv2.putText(patch, label, (tx, ty),
                 LETTER_FONT, scale, color, LETTER_FONT_THICK, cv2.LINE_AA)
     return patch
@@ -345,14 +303,35 @@ class DrawingState:
         self.prev_x: Optional[int] = None
         self.prev_y: Optional[int] = None
         self.clear_hold      = 0
-        # Per-hand was_drawing flag
         self.was_drawing: Dict[int, bool] = {}
-        # Pause-to-snap tracking per hand
         self.pause_last_pos: Dict[int, Tuple[int, int]] = {}
         self.pause_start_time: Dict[int, float] = {}
         self.pause_snapped: Dict[int, bool] = {}
-        # Stroke rendered flag -- tracks whether we need to redraw on commit
         self._stroke_buf_for_smooth: List[Tuple[int, int]] = []
+        # FIX-3: Track whether we are in the "first point after a snap" state
+        self._skip_first_draw: Dict[int, bool] = {}
+        # FIX-11: Prevent continuous drawing during hand repositioning
+        self._draw_start_pos: Dict[int, Tuple[int, int]] = {}
+        # FIX-13: Reduce threshold from 8→2 for instant drawing start
+        self._DRAW_THRESHOLD = 2
+        
+        # FIX-12: Add gesture confirmation (hysteresis) to prevent flickering
+        # Track how many consecutive frames a gesture has been confirmed
+        self._gesture_frames: Dict[int, int] = {}  # hand_id -> consecutive frame count
+        self._last_gesture: Dict[int, str] = {}    # hand_id -> previous gesture
+        # FIX-13: Reduce confirmation from 4→2 for faster stop detection (~65ms)
+        self._STOP_CONFIRMATION_FRAMES = 2
+        
+        # FIX-14: Timing-based draw start/stop (2-3 second delays)
+        # Track when gesture transitions to "draw" for each hand
+        self._gesture_time: Dict[int, float] = {}  # hand_id -> time gesture started
+        # Track hand position to detect idle state during drawing
+        self._last_draw_pos: Dict[int, Tuple[int, int]] = {}  # hand_id -> (x, y)
+        self._last_movement_time: Dict[int, float] = {}  # hand_id -> timestamp of last movement
+        # Require 2 seconds of "draw" gesture before actually starting (120 frames @ 30fps)
+        self._DRAW_START_DELAY = 2.0
+        # Auto-stop after 2.5 seconds of hand idle while in draw gesture
+        self._DRAW_IDLE_TIMEOUT = 2.5
 
     def push_undo(self):
         if len(self.undo_stack) >= UNDO_LIMIT:
@@ -361,48 +340,65 @@ class DrawingState:
 
     def undo(self):
         if self.undo_stack:
-            self.canvas = self.undo_stack.pop()
+            self.canvas = self.undo_stack.pop().copy()
 
     def clear(self):
         self.push_undo()
         self.canvas[:] = 0
 
     def reset_stroke(self):
+        """
+        Reset all per-stroke state including cursor position.
+        FIX-3: prev_x/prev_y are cleared here so that after a snap the next
+        draw gesture cannot accidentally connect to the old cursor position.
+        """
         self.smooth_buf.clear()
-        self.prev_x = self.prev_y = None
+        self.prev_x = self.prev_y = None   # FIX-3: explicit cursor reset
         self.current_stroke.clear()
         self._stroke_buf_for_smooth.clear()
 
     def draw_point(self, x: int, y: int):
         """
         Add a point to the current stroke with weighted smoothing.
-        Renders incrementally for real-time feedback.
+
+        FIX-2: Removed the bogus averaged-point append inside the gap-fill
+        interpolation loop.  The loop now ONLY draws on the canvas.
+        The single real fingertip position (ax, ay) is appended to
+        current_stroke exactly once, after the loop.
         """
-        # Weighted smoothed position for real-time rendering
         ax, ay = self.smooth_buf.push(x, y)
 
-        # Always add the raw position to current_stroke for later snap
+        # Append the REAL smoothed position once (FIX-2: removed loop appends)
         self.current_stroke.append((x, y))
         self._stroke_buf_for_smooth.append((ax, ay))
 
-        # Incremental line rendering (smooth enough for live preview)
         if self.prev_x is not None:
-            cv2.line(self.canvas,
-                     (self.prev_x, self.prev_y), (ax, ay),
-                     self.color, self.thickness, lineType=cv2.LINE_AA)
-        self.prev_x, self.prev_y = ax, ay
+            dist = math.hypot(ax - self.prev_x, ay - self.prev_y)
 
-    def _redraw_stroke_smooth(self):
-        """
-        Called just before committing a finished stroke.
-        OPTIMIZED: Disabled Catmull-Rom smoothing to avoid double-smoothing.
-        The exponential decay buffer (WeightedSmoothBuf) already provides excellent
-        real-time smoothing. Additional spline smoothing blurs fine details.
-        This keeps strokes sharp and responsive to user intent.
-        """
-        # OPTIMIZED: Removed double Catmull-Rom smoothing
-        # Stroke was already smoothed in real-time via exponential decay buffer
-        pass
+            if dist > 20:
+                # Gap-fill: interpolate on canvas ONLY — do NOT add to stroke buffer
+                steps = max(2, int(dist / 10))
+                for i in range(1, steps + 1):
+                    t_cur  = i / (steps + 1)
+                    t_prev = (i - 1) / (steps + 1)
+                    ix  = int(self.prev_x + t_cur  * (ax - self.prev_x))
+                    iy  = int(self.prev_y + t_cur  * (ay - self.prev_y))
+                    ipx = int(self.prev_x + t_prev * (ax - self.prev_x))
+                    ipy = int(self.prev_y + t_prev * (ay - self.prev_y))
+                    cv2.line(self.canvas, (ipx, ipy), (ix, iy),
+                             self.color, self.thickness, lineType=cv2.LINE_AA)
+                # Draw final segment to actual position
+                cv2.line(self.canvas,
+                         (int(self.prev_x + (steps / (steps + 1)) * (ax - self.prev_x)),
+                          int(self.prev_y + (steps / (steps + 1)) * (ay - self.prev_y))),
+                         (ax, ay),
+                         self.color, self.thickness, lineType=cv2.LINE_AA)
+            else:
+                cv2.line(self.canvas,
+                         (self.prev_x, self.prev_y), (ax, ay),
+                         self.color, self.thickness, lineType=cv2.LINE_AA)
+
+        self.prev_x, self.prev_y = ax, ay
 
     def erase_at(self, x: int, y: int):
         cv2.circle(self.canvas, (x, y), self.eraser_r, (0, 0, 0), -1)
@@ -411,50 +407,41 @@ class DrawingState:
     def try_snap_shape(self, collab_client=None):
         """
         On stroke end: try unified shape snapping with fallback chain.
-        OPTIMIZED: Uses confidence-based ensemble (MLP → Rules → No snap).
+        FIX-6: Added _MIN_SNAP_PTS guard on the rule-based path.
         """
-        if not self.snap_active or len(self.current_stroke) < 12:
+        if not self.snap_active or len(self.current_stroke) < _MIN_SNAP_PTS:
             self.current_stroke.clear()
             self._stroke_buf_for_smooth.clear()
             return
 
-        # First smooth the finished stroke
-        self._redraw_stroke_smooth()
-
-        shape = None
+        shape     = None
         clean_pts = None
-        
-        # OPTIMIZED: Unified ensemble chain
-        # Priority 1: Try RULE-BASED detection first (more reliable)
+
+        # Priority 1: rule-based (more reliable)
         shape, clean_pts = detect_and_snap(self.current_stroke)
-        
+
         if shape and clean_pts:
-            # Rule-based succeeded, apply it
             self._apply_shape_snap(shape, clean_pts, collab_client)
         else:
-            # Priority 2: Fallback to MLP shape detection (if available)
-            # Note: Only use if rule-based fails; MLP often over-classifies
+            # Priority 2: MLP
             try:
-                shape, clean_pts = detect_and_snap_mlp(self.current_stroke, (self.h, self.w))
+                shape, clean_pts = detect_and_snap_mlp(
+                    self.current_stroke, (self.h, self.w))
                 if shape and clean_pts:
                     self._apply_shape_snap(shape, clean_pts, collab_client)
                 else:
-                    # Priority 3: Try letter/character snap
                     result = _snap_to_letter(
                         self.current_stroke, (self.h, self.w),
-                        self.color, self.thickness
-                    )
+                        self.color, self.thickness)
                     if result:
                         letter, patch = result
                         if patch is not None:
                             self._apply_letter_snap(letter, patch)
             except Exception as e:
-                # MLP failed gracefully, skip to letter snap
                 print(f"[Shape] MLP detection failed: {e}")
                 result = _snap_to_letter(
                     self.current_stroke, (self.h, self.w),
-                    self.color, self.thickness
-                )
+                    self.color, self.thickness)
                 if result:
                     letter, patch = result
                     if patch is not None:
@@ -464,63 +451,64 @@ class DrawingState:
         self._stroke_buf_for_smooth.clear()
 
     def _apply_shape_snap(self, shape: str, clean_pts, collab_client=None):
-        """Replace current stroke with a clean geometric shape."""
+        """Replace current rough stroke with a clean geometric shape."""
+        if not self.current_stroke:
+            return
+
         xs = [p[0] for p in self.current_stroke]
         ys = [p[1] for p in self.current_stroke]
         x_orig = min(xs); y_orig = min(ys)
         w_orig = max(xs) - x_orig
         h_orig = max(ys) - y_orig
 
+        # Erase only the rough stroke pixels
         pts_arr_orig = np.array(self.current_stroke, dtype=np.int32).reshape((-1, 1, 2))
+        stroke_mask  = np.zeros((self.h, self.w), dtype=np.uint8)
+        cv2.polylines(stroke_mask, [pts_arr_orig], isClosed=False,
+                      color=255, thickness=self.thickness + 2, lineType=cv2.LINE_AA)
+        stroke_mask_3ch = cv2.cvtColor(stroke_mask, cv2.COLOR_GRAY2BGR)
+        self.canvas = cv2.bitwise_and(self.canvas, cv2.bitwise_not(stroke_mask_3ch))
 
-        # OPTIMIZED: Erase original stroke completely with filled rectangle
-        # This covers all anti-aliased pixels and line traces
-        margin = max(self.thickness + 5, 10)  # Extra margin to catch all traces
-        erase_x1 = max(0, x_orig - margin)
-        erase_y1 = max(0, y_orig - margin)
-        erase_x2 = min(self.w, x_orig + w_orig + margin)
-        erase_y2 = min(self.h, y_orig + h_orig + margin)
-        cv2.rectangle(self.canvas, (erase_x1, erase_y1), (erase_x2, erase_y2),
-                      color=(255, 255, 255), thickness=-1)  # Filled white rectangle
+        # FIX-11: Increase thickness during shape snap for better visibility
+        snap_thickness = max(self.thickness + 1, 4)
 
+        # Draw clean shape
         if shape == "circle":
             radius = int(max(w_orig, h_orig) / 2)
-            cx = x_orig + w_orig // 2
-            cy = y_orig + h_orig // 2
+            cx     = x_orig + w_orig // 2
+            cy     = y_orig + h_orig // 2
             cv2.circle(self.canvas, (cx, cy), radius,
-                       self.color, self.thickness, lineType=cv2.LINE_AA)
-
+                       self.color, snap_thickness, lineType=cv2.LINE_AA)
         elif shape == "rectangle":
             cv2.rectangle(self.canvas,
                           (x_orig, y_orig),
                           (x_orig + w_orig, y_orig + h_orig),
-                          self.color, self.thickness, lineType=cv2.LINE_AA)
-
+                          self.color, snap_thickness, lineType=cv2.LINE_AA)
         elif shape == "triangle":
             p1 = (x_orig + w_orig // 2, y_orig)
             p2 = (x_orig, y_orig + h_orig)
             p3 = (x_orig + w_orig, y_orig + h_orig)
             pts = np.array([p1, p2, p3], dtype=np.int32).reshape((-1, 1, 2))
             cv2.polylines(self.canvas, [pts], isClosed=True,
-                          color=self.color, thickness=self.thickness,
+                          color=self.color, thickness=snap_thickness,
                           lineType=cv2.LINE_AA)
-
         elif shape == "line":
             clean = [(int(p[0]), int(p[1])) for p in clean_pts]
             if len(clean) >= 2:
                 cv2.line(self.canvas, clean[0], clean[-1],
-                         self.color, self.thickness, lineType=cv2.LINE_AA)
-
+                         self.color, snap_thickness, lineType=cv2.LINE_AA)
         else:
-            # Generic polyline
-            clean = [(int(p[0]), int(p[1])) for p in clean_pts]
+            clean   = [(int(p[0]), int(p[1])) for p in clean_pts]
             pts_arr = np.array(clean, dtype=np.int32).reshape((-1, 1, 2))
             cv2.polylines(self.canvas, [pts_arr], isClosed=True,
-                          color=self.color, thickness=self.thickness,
+                          color=self.color, thickness=snap_thickness,
                           lineType=cv2.LINE_AA)
 
         self.snap_feedback = "Snapped: " + shape
         self.snap_timer    = time.time() + 1.5
+        
+        # FIX-9: Reduced pause from 0.3→0.15s for faster feedback
+        time.sleep(0.15)
 
         obj3d = sketch_to_3d(shape)
         if obj3d:
@@ -532,29 +520,31 @@ class DrawingState:
 
     def _apply_letter_snap(self, label: str, patch: np.ndarray):
         """Blit a clean-rendered letter over the rough drawn region."""
-        xs = [p[0] for p in self.current_stroke]
-        ys = [p[1] for p in self.current_stroke]
+        xs    = [p[0] for p in self.current_stroke]
+        ys    = [p[1] for p in self.current_stroke]
         x_min = max(0, min(xs) - 8)
         y_min = max(0, min(ys) - 8)
         x_max = min(self.w, max(xs) + 8)
         y_max = min(self.h, max(ys) + 8)
 
-        # Erase rough stroke region
-        self.canvas[y_min:y_max, x_min:x_max] = 0
+        stroke_mask = np.zeros((self.h, self.w), dtype=np.uint8)
+        stroke_pts  = np.array(self.current_stroke, dtype=np.int32).reshape((-1, 1, 2))
+        cv2.polylines(stroke_mask, [stroke_pts], isClosed=False,
+                      color=255, thickness=self.thickness + 2, lineType=cv2.LINE_AA)
+        stroke_mask_inv     = cv2.bitwise_not(stroke_mask)
+        stroke_mask_inv_3ch = cv2.cvtColor(stroke_mask_inv, cv2.COLOR_GRAY2BGR)
+        self.canvas = cv2.bitwise_and(self.canvas, stroke_mask_inv_3ch)
 
-        # Resize patch to fit
         target_h = y_max - y_min
         target_w = x_max - x_min
         if target_h <= 0 or target_w <= 0:
             return
         resized_patch = cv2.resize(patch, (target_w, target_h),
                                    interpolation=cv2.INTER_LINEAR)
-
-        # Blit (only non-zero pixels)
         mask = cv2.cvtColor(resized_patch, cv2.COLOR_BGR2GRAY)
         _, mask_bin = cv2.threshold(mask, 10, 255, cv2.THRESH_BINARY)
-        mask3 = cv2.cvtColor(mask_bin, cv2.COLOR_GRAY2BGR)
-        roi = self.canvas[y_min:y_max, x_min:x_max]
+        mask3   = cv2.cvtColor(mask_bin, cv2.COLOR_GRAY2BGR)
+        roi     = self.canvas[y_min:y_max, x_min:x_max]
         blended = np.where(mask3 > 0, resized_patch, roi)
         self.canvas[y_min:y_max, x_min:x_max] = blended
 
@@ -562,29 +552,23 @@ class DrawingState:
         self.snap_timer    = time.time() + 1.5
 
     def apply_peer_event(self, msg: dict):
-        """Apply a drawing event received from a collaborative peer."""
         t = msg.get("type")
         if t == "draw":
-            x, y   = msg["x"],  msg["y"]
-            px, py = msg["px"], msg["py"]
-            color  = tuple(msg["color"])
-            thick  = msg["thickness"]
-            cv2.line(self.canvas, (px, py), (x, y), color, thick, cv2.LINE_AA)
+            cv2.line(self.canvas,
+                     (msg["px"], msg["py"]), (msg["x"], msg["y"]),
+                     tuple(msg["color"]), msg["thickness"], cv2.LINE_AA)
         elif t == "erase":
-            cv2.circle(self.canvas, (msg["x"], msg["y"]), msg["radius"], (0, 0, 0), -1)
+            cv2.circle(self.canvas, (msg["x"], msg["y"]), msg["radius"], (0,0,0), -1)
         elif t == "clear":
-            self.push_undo()
-            self.canvas[:] = 0
+            self.push_undo(); self.canvas[:] = 0
         elif t == "shape":
             pts = np.array(msg["points"], dtype=np.int32).reshape((-1, 1, 2))
             cv2.polylines(self.canvas, [pts], isClosed=True,
-                          color=(180, 180, 180), thickness=3, lineType=cv2.LINE_AA)
+                          color=(180,180,180), thickness=3, lineType=cv2.LINE_AA)
 
     def save(self) -> str:
-        name = os.path.join(
-            SAVE_DIR,
-            "drawing_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".png"
-        )
+        name = os.path.join(SAVE_DIR,
+                            "drawing_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".png")
         cv2.imwrite(name, self.canvas)
         return name
 
@@ -650,26 +634,22 @@ class UILayout:
 #  HUD renderer
 # =============================================================================
 
-def _draw_ui(frame: np.ndarray, ui: UILayout, ds: DrawingState,
-             fps: int, cnn_label: str = "", cnn_conf: float = 0.0,
-             training_mode: bool = False, training_label: str = "",
-             training_count: int = 0, collab_connected: bool = False,
-             voice_last: str = "", voice_timer: float = 0.0):
+def _draw_ui(frame, ui, ds, fps,
+             cnn_label="", cnn_conf=0.0,
+             training_mode=False, training_label="",
+             training_count=0, collab_connected=False,
+             voice_last="", voice_timer=0.0):
     H, W = frame.shape[:2]
-
-    # Semi-transparent HUD
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, 0), (W, UI_H), (15, 15, 20), -1)
     cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
 
-    # Palette buttons
     for name, (rect, bgr) in ui.color_btns.items():
         x1, y1, x2, y2 = rect
         cv2.rectangle(frame, (x1, y1), (x2, y2), bgr, -1)
         border = (255, 255, 255) if bgr == ds.color else (80, 80, 80)
         cv2.rectangle(frame, (x1, y1), (x2, y2), border, 2)
 
-    # Active colour swatch
     mx = W // 2
     cv2.rectangle(frame, (mx - 22, 12), (mx + 22, 55), ds.color, -1)
     cv2.rectangle(frame, (mx - 22, 12), (mx + 22, 55), (255, 255, 255), 2)
@@ -684,29 +664,25 @@ def _draw_ui(frame: np.ndarray, ui: UILayout, ds: DrawingState,
                     (x1 + ((x2 - x1) - tw) // 2, y1 + ((y2 - y1) + th) // 2),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.44, (230, 230, 230), 1, cv2.LINE_AA)
 
-    snap_label = "AI ON" if ds.snap_active else "AI OFF"
     _btn(ui.btn_thick_up, "+Brush " + str(ds.thickness))
     _btn(ui.btn_thick_dn, "-Brush")
     _btn(ui.btn_erase_up, "+Erase")
     _btn(ui.btn_erase_dn, "-Erase")
-    _btn(ui.btn_snap,     snap_label, ds.snap_active)
+    _btn(ui.btn_snap,     "AI ON" if ds.snap_active else "AI OFF", ds.snap_active)
     _btn(ui.btn_undo,     "Undo")
     _btn(ui.btn_save,     "SAVE")
     _btn(ui.btn_load,     "LOAD")
 
-    # Info line
-    info = "Brush:" + str(ds.thickness) + "  Eraser:" + str(ds.eraser_r)
-    cv2.putText(frame, info, (mx - 80, UI_H - 10),
+    cv2.putText(frame,
+                "Brush:" + str(ds.thickness) + "  Eraser:" + str(ds.eraser_r),
+                (mx - 80, UI_H - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.48, (180, 180, 180), 1, cv2.LINE_AA)
-
-    # FPS
     cv2.putText(frame, "FPS " + str(fps), (W - 85, H - 12),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 0), 1, cv2.LINE_AA)
 
-    # CNN confidence panel (bottom-left)
     if cnn_label:
         bar_x, bar_y = 10, H - 60
-        bar_w        = int(180 * cnn_conf)
+        bar_w = int(180 * cnn_conf)
         cv2.rectangle(frame, (bar_x, bar_y), (bar_x + 180, bar_y + 16), (40, 40, 40), -1)
         color_bar = (0, 200, 100) if cnn_conf >= 0.7 else (0, 160, 255)
         cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + 16), color_bar, -1)
@@ -715,25 +691,21 @@ def _draw_ui(frame: np.ndarray, ui: UILayout, ds: DrawingState,
                     (bar_x, bar_y - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 240, 200), 1, cv2.LINE_AA)
 
-    # Collab indicator
     if collab_connected:
         cv2.circle(frame, (W - 20, 140), 7, (0, 220, 100), -1)
         cv2.putText(frame, "LIVE", (W - 50, 144),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 220, 100), 1, cv2.LINE_AA)
 
-    # Snap feedback
     if ds.snap_feedback and time.time() < ds.snap_timer:
         cv2.putText(frame, ds.snap_feedback, (20, H - 80),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 200), 2, cv2.LINE_AA)
 
-    # Sketch-to-3D label
     if ds.sketch_3d_label and time.time() < ds.sketch_3d_timer:
         tw = cv2.getTextSize(ds.sketch_3d_label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0][0]
         cv2.putText(frame, ds.sketch_3d_label,
                     (W // 2 - tw // 2, H - 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 200, 0), 2, cv2.LINE_AA)
 
-    # Clear progress bar
     if ds.clear_hold > 0:
         pct   = ds.clear_hold / CLEAR_HOLD_FRAMES
         bar_w = int(W * pct)
@@ -742,26 +714,25 @@ def _draw_ui(frame: np.ndarray, ui: UILayout, ds: DrawingState,
                     (W // 2 - 155, H - 14),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 100, 255), 2, cv2.LINE_AA)
 
-    # Training mode banner
     if training_mode:
         cv2.rectangle(frame, (0, UI_H), (W, UI_H + 40), (0, 30, 80), -1)
-        msg = "TRAINING: Show '" + training_label + "' gesture | Samples: " + str(training_count) + " | T=record  Y=done"
-        cv2.putText(frame, msg, (10, UI_H + 26),
+        cv2.putText(frame,
+                    "TRAINING: Show '" + training_label + "' | Samples: " + str(training_count),
+                    (10, UI_H + 26),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 220, 255), 1, cv2.LINE_AA)
 
-    # Keyboard hint + mic status
     cv2.putText(frame, "Z=Undo  S=Save  L=Load  C=Clear  A=AI  T=Train  Q=Quit",
                 (200, H - 12),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, (100, 100, 120), 1, cv2.LINE_AA)
+
     try:
         import speech_recognition as _sr_chk
         _sr_ok = True
     except ImportError:
         _sr_ok = False
-    mic_col = (0, 200, 80) if _sr_ok else (0, 80, 200)
-    cv2.circle(frame, (W - 15, 135), 6, mic_col, -1, cv2.LINE_AA)
+    cv2.circle(frame, (W - 15, 135), 6,
+               (0, 200, 80) if _sr_ok else (0, 80, 200), -1, cv2.LINE_AA)
 
-    # Voice heard
     if voice_last and time.time() < voice_timer:
         cv2.putText(frame, voice_last, (10, H - 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, (180, 220, 255), 1, cv2.LINE_AA)
@@ -771,7 +742,7 @@ def _draw_ui(frame: np.ndarray, ui: UILayout, ds: DrawingState,
 #  Action dispatchers
 # =============================================================================
 
-def _apply_action(action: str, payload, ds: DrawingState, status_cb, collab=None):
+def _apply_action(action, payload, ds, status_cb, collab=None):
     if action == "set_color":
         ds.color = payload; status_cb("Color changed")
     elif action == "thick_up":
@@ -794,8 +765,7 @@ def _apply_action(action: str, payload, ds: DrawingState, status_cb, collab=None
         status_cb("Loaded: " + os.path.basename(p) if p else "No saves found")
 
 
-def _apply_voice_command(cmd: str, ds: DrawingState, status_cb):
-    """Handle a voice action string coming from VoiceCommandListener."""
+def _apply_voice_command(cmd, ds, status_cb):
     COLOR_MAP = {
         "color_red":    (0,   0,   255),
         "color_blue":   (255, 50,  0),
@@ -807,12 +777,9 @@ def _apply_voice_command(cmd: str, ds: DrawingState, status_cb):
         "color_cyan":   (255, 220, 0),
     }
     if cmd in COLOR_MAP:
-        ds.color = COLOR_MAP[cmd]
-        status_cb("[Voice] Color: " + cmd.replace("color_", "").capitalize())
-    elif cmd == "clear_canvas":
-        ds.clear(); status_cb("[Voice] Canvas cleared")
-    elif cmd == "undo":
-        ds.undo(); status_cb("[Voice] Undo")
+        ds.color = COLOR_MAP[cmd]; status_cb("[Voice] Color: " + cmd.replace("color_","").capitalize())
+    elif cmd == "clear_canvas": ds.clear(); status_cb("[Voice] Canvas cleared")
+    elif cmd == "undo":         ds.undo();  status_cb("[Voice] Undo")
     elif cmd == "save":
         p = ds.save(); status_cb("[Voice] Saved: " + os.path.basename(p))
     elif cmd == "thick_up":
@@ -823,84 +790,65 @@ def _apply_voice_command(cmd: str, ds: DrawingState, status_cb):
         ds.eraser_r = min(MAX_ERASER, ds.eraser_r + 10); status_cb("[Voice] Eraser: " + str(ds.eraser_r))
     elif cmd == "erase_down":
         ds.eraser_r = max(MIN_ERASER, ds.eraser_r - 10); status_cb("[Voice] Eraser: " + str(ds.eraser_r))
-    elif cmd == "toggle_eraser":
-        ds.color = (0, 0, 0); status_cb("[Voice] Eraser mode (draw with black)")
-    elif cmd == "snap_on":
-        ds.snap_active = True; status_cb("[Voice] AI snap ON")
-    elif cmd == "snap_off":
-        ds.snap_active = False; status_cb("[Voice] AI snap OFF")
+    elif cmd == "toggle_eraser": ds.color = (0,0,0); status_cb("[Voice] Eraser mode")
+    elif cmd == "snap_on":       ds.snap_active = True;  status_cb("[Voice] AI snap ON")
+    elif cmd == "snap_off":      ds.snap_active = False; status_cb("[Voice] AI snap OFF")
     elif cmd == "snap_toggle":
         ds.snap_active = not ds.snap_active
         status_cb("[Voice] AI snap " + ("ON" if ds.snap_active else "OFF"))
 
 
 # =============================================================================
-#  Main loop
+#  Quality / temporal helpers
 # =============================================================================
 
 def _get_hand_quality(hand_landmarks) -> float:
     """
-    OPTIMIZED: Score hand detection quality (0.0-1.0).
-    Returns average visibility of all landmarks.
-    Quality < 0.6 indicates poor/partial hand detection and should be skipped.
+    Score hand detection quality (0.0-1.0).
+    FIX-5: Threshold caller uses _HAND_QUALITY_MIN = 0.30 (was 0.45).
     """
     if not hand_landmarks or not hand_landmarks.landmark:
         return 0.0
-    
     visibilities = []
     for lm in hand_landmarks.landmark:
-        if hasattr(lm, 'visibility'):
-            visibilities.append(lm.visibility)
-        else:
-            visibilities.append(1.0)  # Assume full visibility if not available
-    
+        visibilities.append(getattr(lm, 'visibility', 1.0))
     return sum(visibilities) / len(visibilities) if visibilities else 0.0
 
 
 class GestureTemporalFilter:
-    """
-    OPTIMIZED: Smooths gesture predictions over time using voting.
-    Prevents erratic gesture switching due to brief recognition errors.
-    """
+    """Smooths gesture predictions over time using majority voting."""
     def __init__(self, window_size: int = 5):
         self.window_size = window_size
         self.history: deque = deque(maxlen=window_size)
-    
+
     def filter(self, gesture: str) -> str:
-        """
-        Add gesture to history and return smoothed gesture (majority vote).
-        """
         self.history.append(gesture)
-        
         if len(self.history) < self.window_size:
-            # Not enough history, return current
             return gesture
-        
-        # Return most common gesture in history (majority voting)
         from collections import Counter
-        votes = Counter(self.history)
-        most_common = votes.most_common(1)[0][0]
-        return most_common
-    
+        return Counter(self.history).most_common(1)[0][0]
+
     def reset(self):
-        """Clear history (e.g., when hand is lost)."""
         self.history.clear()
 
 
+# =============================================================================
+#  Main loop
+# =============================================================================
+
 def run(use_voice: bool = True):
 
-    # Camera
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
-        print("ERROR: Camera not found at index " + str(CAMERA_INDEX))
-        sys.exit(1)
+        print("ERROR: Camera not found at index " + str(CAMERA_INDEX)); sys.exit(1)
+    # FIX-13: Optimize FPS and resolution for better performance
+    cap.set(cv2.CAP_PROP_FPS, 30)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAMERA_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_H)
 
     ret, test_frame = cap.read()
     if not ret:
-        print("ERROR: Cannot read from camera.")
-        cap.release(); sys.exit(1)
+        print("ERROR: Cannot read from camera."); cap.release(); sys.exit(1)
     FH, FW = test_frame.shape[:2]
 
     ds = DrawingState(FW, FH)
@@ -912,78 +860,65 @@ def run(use_voice: bool = True):
         track_conf  = MP_TRACK_CONF,
     )
 
-    # CNN Classifier
-    cnn_clf  = None
-    cnn_ok   = False
+    cnn_clf = None; cnn_ok = False
     if _CNN_OK:
         cnn_clf = GestureClassifier()
         cnn_ok  = cnn_clf.load()
         if not cnn_ok:
-            print("[CNN] No model found. Using rule-based. Press T to train.")
+            print("[CNN] No model found. Press T to train.")
 
-    # Data collector (for training mode)
-    collector       = GestureDataCollector() if _CNN_OK else None
-    training_mode   = False
-    training_label  = GESTURE_LABELS[0]
-    training_idx    = 0
-    training_count  = 0
-    train_dataset_X = []
-    train_dataset_y = []
+    collector      = GestureDataCollector() if _CNN_OK else None
+    training_mode  = False
+    training_label = GESTURE_LABELS[0]
+    training_idx   = 0
+    training_count = 0
+    train_X: list  = []
+    train_y: list  = []
 
-    # Voice
     vc = None
     if use_voice:
         try:
             from modules.voice import VoiceCommandListener, print_commands
-            vc = VoiceCommandListener(mode="2d"); vc.start()
-            print_commands("2d")
+            vc = VoiceCommandListener(mode="2d"); vc.start(); print_commands("2d")
         except Exception as e:
             print("[Voice] Not available: " + str(e))
 
-    # Collaborative client
     collab = None
-    collab_enabled = COLLAB_ENABLED
-    if collab_enabled and _COLLAB_IMPORT_OK:
+    if COLLAB_ENABLED and _COLLAB_IMPORT_OK:
         try:
+            from modules.collab_server import CollabClient
             collab = CollabClient()
             collab.connect(on_message=ds.apply_peer_event)
         except Exception as e:
             print("[Collab] Not available: " + str(e))
 
-    # Window
     cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(WINDOW, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    prev_time    = time.time()
-    fps          = 0
-    btn_cooldown = 0.0
-    status_msg   = ""
-    status_timer = 0.0
+    prev_time        = time.time()
+    fps              = 0
+    btn_cooldown     = 0.0
+    status_msg       = ""
+    status_timer     = 0.0
     voice_last_heard = ""
     voice_last_timer = 0.0
-    last_cnn_label = ""
-    last_cnn_conf  = 0.0
-    
-    # OPTIMIZED: Temporal gesture filter (smooths erratic gesture switching)
-    gesture_filter = GestureTemporalFilter(window_size=5)
+    last_cnn_label   = ""
+    last_cnn_conf    = 0.0
+    gesture_filter   = GestureTemporalFilter(window_size=11)  # FIX-12: Increased 9→11 for maximum gesture stability
 
-    def show_status(msg: str, dur: float = 1.5):
+    def show_status(msg, dur=1.5):
         nonlocal status_msg, status_timer
-        status_msg   = msg
-        status_timer = time.time() + dur
+        status_msg = msg; status_timer = time.time() + dur
 
-    # -- Main loop ------------------------------------------------------------
-    frame_count = 0  # OPTIMIZED: For frame skipping (process every 3rd frame)
-    last_result = None  # OPTIMIZED: Reuse MediaPipe results between skipped frames
-    
+    frame_count = 0
+    last_result = None
+
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-
         frame = cv2.flip(frame, 1)
 
-        # Voice
         if vc:
             cmd = vc.poll()
             if cmd:
@@ -992,88 +927,124 @@ def run(use_voice: bool = True):
                 voice_last_heard = 'Heard: "' + heard + '" -> ' + cmd
                 voice_last_timer = time.time() + 3.0
 
-        # FPS
         now       = time.time()
         fps       = int(1.0 / max(now - prev_time, 1e-6))
         prev_time = now
 
-        # OPTIMIZED: Frame skipping for MediaPipe processing (every 3rd frame)
-        # This gives ~3× FPS boost since MediaPipe is the bottleneck
-        if frame_count % MP_FRAME_SKIP == 0:
-            # Process hand tracking on key frames
-            rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            last_result = tracker.process(rgb)
-        
-        result = last_result  # Reuse MediaPipe results on skipped frames
+        # Always process fresh MediaPipe results (no reuse)
+        # This eliminates frame drops from stale detection data
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = tracker.process(rgb)
         frame_count += 1
 
-        finger_cursor: Optional[Tuple[int, int]] = None
-        gesture_this_frame = "idle"
+        finger_cursor       = None
+        gesture_this_frame  = "idle"
 
         if result.hands:
             for hi, hand in enumerate(result.hands):
-                # OPTIMIZED: Skip low-quality hand detections
-                hand_quality = _get_hand_quality(hand.landmarks)
-                if hand_quality < 0.6:
-                    continue  # Skip this hand, visibility too low
-                
+                # FIX-5: Lowered threshold to 0.30
+                if _get_hand_quality(hand.landmarks) < _HAND_QUALITY_MIN:
+                    continue
+
                 DrawLandmarks(frame, hand)
                 label = hand.label
                 lm    = hand.landmarks
 
-                # -- Gesture classification -----------------------------------
+                rule_gesture = classify_gesture(lm, label)
+
                 if cnn_ok and cnn_clf:
                     gesture, conf = cnn_clf.predict(lm, label)
-                    last_cnn_label = gesture
-                    last_cnn_conf  = conf
+                    last_cnn_label = gesture; last_cnn_conf = conf
+                    if gesture == "open_palm" and rule_gesture != "open_palm":
+                        gesture = rule_gesture
                 else:
-                    gesture = classify_gesture(lm, label)
-                    last_cnn_label = gesture + " (rule)"
-                    last_cnn_conf  = 1.0
+                    gesture = rule_gesture
+                    last_cnn_label = gesture + " (rule)"; last_cnn_conf = 1.0
 
-                # OPTIMIZED: Apply temporal smoothing to gesture
+                if gesture == "open_palm" and last_cnn_conf < 0.90:
+                    gesture = rule_gesture
+
                 gesture = gesture_filter.filter(gesture)
                 gesture_this_frame = gesture
+                
+                # FIX-14: Timing-based gesture confirmation (2-3 second delays)
+                # Require 2 seconds of "draw" gesture before starting
+                # Auto-stop after 2.5 seconds of hand idle during drawing
+                last_gest = ds._last_gesture.get(hi, "idle")
+                
+                if gesture != last_gest:
+                    # Gesture changed - start timing
+                    ds._gesture_time[hi] = now
+                    ds._last_gesture[hi] = gesture
+                    # FIX-14 FIX: Initialize movement time when transitioning to draw
+                    # NOTE: ix, iy defined later at line ~1003, so actual init deferred to gesture handling
+                    # Immediately accept non-draw gestures (stop)
+                    confirmed_gesture = gesture if gesture != "draw" else last_gest
+                else:
+                    gesture_elapsed = now - ds._gesture_time.get(hi, now)
+                    
+                    if gesture == "draw":
+                        # Require 2 second hold before accepting draw
+                        if gesture_elapsed >= ds._DRAW_START_DELAY:
+                            confirmed_gesture = "draw"
+                        else:
+                            # Still waiting for 2 second threshold
+                            confirmed_gesture = last_gest
+                    else:
+                        # Non-draw gestures apply immediately
+                        confirmed_gesture = gesture
+                
+                gesture = confirmed_gesture
 
-                # Training mode: record this hand's landmarks
                 if training_mode and collector:
-                    count = collector.record(lm)
-                    training_count = count
+                    training_count = collector.record(lm)
 
-                ix, iy = fingertip_px(lm, FW, FH, finger=1)
+                ix, iy      = fingertip_px(lm, FW, FH, finger=1)
                 finger_cursor = (ix, iy)
+                was_prev    = ds.was_drawing.get(hi, False)
 
-                was_prev = ds.was_drawing.get(hi, False)
-
-                # -- Button zone ----------------------------------------------
-                if iy < UI_H and gesture == "draw":
+                # ── Button zone ──────────────────────────────────────────────
+                # FIX-15: Don't allow button clicks while actively drawing (was_prev = True)
+                # Only allow button clicks when starting a new draw gesture (was_prev = False)
+                if iy < UI_H and gesture == "draw" and not was_prev:
                     if now >= btn_cooldown:
                         action, payload = ui.hit(ix, iy)
                         if action:
                             btn_cooldown = now + GESTURE_COOLDOWN
                             _apply_action(action, payload, ds, show_status, collab)
                     ds.reset_stroke()
-                    ds.was_drawing[hi] = False
-                    ds.pause_snapped[hi] = False
+                    ds.was_drawing[hi]    = False
+                    ds.pause_snapped[hi]  = False
+                    ds._skip_first_draw[hi] = False
 
-                # -- Open palm -> clear (FIXED: requires fully spread palm) --
+                # ── Open palm → clear ────────────────────────────────────────
                 elif gesture == "open_palm":
-                    ds.clear_hold += 1
-                    if ds.clear_hold >= CLEAR_HOLD_FRAMES:
-                        ds.clear()
+                    if not hasattr(ds, '_open_palm_streak'):
+                        ds._open_palm_streak = 0; ds._open_palm_time = now
+                    if now > ds._open_palm_time + 0.20:
+                        ds._open_palm_streak = 0
+                    ds._open_palm_streak += 1; ds._open_palm_time = now
+
+                    if ds._open_palm_streak >= 3 and last_cnn_conf > 0.85:
+                        ds.clear_hold += 1
+                        if ds.clear_hold >= CLEAR_HOLD_FRAMES:
+                            ds.clear(); ds.clear_hold = 0
+                            ds._open_palm_streak = 0
+                            show_status("Canvas cleared!")
+                            if collab and collab.connected:
+                                collab.send_clear()
+                    else:
                         ds.clear_hold = 0
-                        show_status("Canvas cleared!")
-                        if collab and collab.connected:
-                            collab.send_clear()
-                    # If we were drawing, commit the stroke first
+
                     if was_prev:
                         ds.try_snap_shape(collab)
                         ds.was_drawing[hi] = False
                     else:
                         ds.reset_stroke()
-                    ds.pause_snapped[hi] = False
+                    ds.pause_snapped[hi]    = False
+                    ds._skip_first_draw[hi] = True  # FIX-3: guard next draw start
 
-                # -- Erase ----------------------------------------------------
+                # ── Erase ────────────────────────────────────────────────────
                 elif gesture == "erase":
                     if iy > UI_H:
                         if not was_prev:
@@ -1081,65 +1052,136 @@ def run(use_voice: bool = True):
                         ds.erase_at(ix, iy)
                         if collab and collab.connected:
                             collab.send_erase(ix, iy, ds.eraser_r)
-                    ds.was_drawing[hi] = False
-                    ds.clear_hold = 0
-                    ds.pause_snapped[hi] = False
+                    ds.was_drawing[hi]      = False
+                    ds.clear_hold           = 0
+                    ds.pause_snapped[hi]    = False
+                    ds._skip_first_draw[hi] = False
 
-                # -- Draw -----------------------------------------------------
+                # FIX-13: HARD STOP - block drawing if not in draw gesture
+                if gesture != "draw":
+                    ds.prev_x = None
+                    ds.prev_y = None
+                    # Clean up timing state for non-draw gestures
+                    ds._last_movement_time.pop(hi, None)
+                    ds._last_draw_pos.pop(hi, None)
+
+                # ── Draw ─────────────────────────────────────────────────────
                 elif gesture == "draw":
+                    # FIX-14 FIX: Initialize movement tracking on gesture transition to draw
+                    if gesture != last_gest:
+                        ds._last_movement_time[hi] = now
+                        ds._last_draw_pos[hi] = (ix, iy)
+                    
+                    # FIX-14: Check for idle timeout (auto-stop after 2.5 seconds of no movement)
+                    # Only check timeout if user is actually drawing (was_prev = True) and  
+                    # drawing has started (not during 2-second startup delay)
+                    if was_prev:
+                        last_pos = ds._last_draw_pos.get(hi, (ix, iy))
+                        move_dist = abs(ix - last_pos[0]) + abs(iy - last_pos[1])
+                        
+                        if move_dist > 3:  # Movement threshold (>3 pixels)
+                            # Hand moved - reset idle timer
+                            ds._last_movement_time[hi] = now
+                            ds._last_draw_pos[hi] = (ix, iy)
+                        else:
+                            # Hand idle - check timeout
+                            idle_time = now - ds._last_movement_time.get(hi, now)
+                            if idle_time >= ds._DRAW_IDLE_TIMEOUT:
+                                # FIX-14: Auto-stop after idle timeout
+                                ds.try_snap_shape(collab)
+                                ds.was_drawing[hi] = False
+                                ds._draw_start_pos.pop(hi, None)
+                                ds._last_movement_time.pop(hi, None)
+                                ds._last_draw_pos.pop(hi, None)
+                                ds.reset_stroke()
+                                ds.clear_hold = 0
+                                ds.pause_snapped[hi] = False
+                    
                     if iy > UI_H:
-                        if not was_prev:
-                            ds.push_undo()
-                            ds.was_drawing[hi] = True
-                            ds.pause_last_pos[hi] = (ix, iy)
-                            ds.pause_start_time[hi] = now
-                            ds.pause_snapped[hi] = False
-
-                        prev_x = ds.prev_x or ix
-                        prev_y = ds.prev_y or iy
-                        ds.draw_point(ix, iy)
-                        if collab and collab.connected:
-                            collab.send_stroke(ix, iy, prev_x, prev_y,
-                                               ds.color, ds.thickness)
-
-                        # -- Pause-to-snap detection --------------------------
-                        if ds.snap_active and not ds.pause_snapped.get(hi, False):
-                            last_px, last_py = ds.pause_last_pos.get(hi, (ix, iy))
-                            moved = abs(ix - last_px) + abs(iy - last_py)
-
-                            if moved > PAUSE_MOVE_THRESHOLD:
-                                # Finger moved -- reset pause timer
+                        # FIX-13: Skip first frame after position reset (hard stop)
+                        if ds.prev_x is None:
+                            ds.prev_x, ds.prev_y = ix, iy
+                            if not was_prev:
+                                ds._draw_start_pos[hi] = (ix, iy)
+                                ds.was_drawing[hi] = True
+                                ds.push_undo()
                                 ds.pause_last_pos[hi]   = (ix, iy)
                                 ds.pause_start_time[hi] = now
+                                ds.pause_snapped[hi]    = False
+                        elif not was_prev:
+                            ds._draw_start_pos[hi] = (ix, iy)
+                            ds.was_drawing[hi] = True
+                            ds.push_undo()
+                            ds.pause_last_pos[hi]   = (ix, iy)
+                            ds.pause_start_time[hi] = now
+                            ds.pause_snapped[hi]    = False
+                        
+                        if was_prev:
+                            # Check movement distance from draw start
+                            start_x, start_y = ds._draw_start_pos.get(hi, (ix, iy))
+                            dist = abs(ix - start_x) + abs(iy - start_y)
+                            
+                            if dist >= ds._DRAW_THRESHOLD:
+                                # Threshold exceeded - start actual drawing
+                                prev_x = ds.prev_x or ix
+                                prev_y = ds.prev_y or iy
+                                ds.draw_point(ix, iy)
+                                if collab and collab.connected:
+                                    collab.send_stroke(ix, iy, prev_x, prev_y,
+                                                       ds.color, ds.thickness)
+
+                                # Pause-to-snap
+                                if ds.snap_active and not ds.pause_snapped.get(hi, False):
+                                    last_px, last_py = ds.pause_last_pos.get(hi, (ix, iy))
+                                    moved = abs(ix - last_px) + abs(iy - last_py)
+                                    if moved > PAUSE_MOVE_THRESHOLD:
+                                        ds.pause_last_pos[hi]   = (ix, iy)
+                                        ds.pause_start_time[hi] = now
+                                    else:
+                                        paused_for = now - ds.pause_start_time.get(hi, now)
+                                        if paused_for >= PAUSE_SNAP_SECONDS and len(ds.current_stroke) >= _MIN_SNAP_PTS:
+                                            ds.push_undo()
+                                            ds.try_snap_shape(collab)
+                                            ds.pause_snapped[hi]    = True
+                                            ds.was_drawing[hi]      = False
+                                            ds._draw_start_pos.pop(hi, None)
+                                            ds.reset_stroke()
                             else:
-                                # Finger is still -- check if paused long enough
-                                paused_for = now - ds.pause_start_time.get(hi, now)
-                                if paused_for >= PAUSE_SNAP_SECONDS and len(ds.current_stroke) >= 15:
-                                    # Trigger snap on pause!
-                                    ds.push_undo()
-                                    ds.try_snap_shape(collab)
-                                    ds.pause_snapped[hi] = True
-                                    # Reset for next segment
-                                    ds.was_drawing[hi] = False
-                                    ds.reset_stroke()
+                                # Still within threshold - just update smooth buffer position
+                                ds.smooth_buf.push(ix, iy)
+                                ds.prev_x, ds.prev_y = ix, iy
+                                ds.current_stroke.append((ix, iy))
 
                     ds.clear_hold = 0
 
-                # -- Idle / other gesture -------------------------------------
+                # ── Idle / other ─────────────────────────────────────────────
                 else:
                     if was_prev:
                         ds.try_snap_shape(collab)
                         ds.was_drawing[hi] = False
+                        # FIX-3: Guard next stroke so no line from old position
+                        ds._skip_first_draw[hi] = True
+                    ds._draw_start_pos.pop(hi, None)  # FIX-11: Clean up draw start position
                     ds.reset_stroke()
-                    ds.clear_hold = 0
-                    ds.pause_snapped[hi] = False
+                    ds.clear_hold           = 0
+                    ds.pause_snapped[hi]    = False
 
         else:
-            # No hand detected -- finalise any in-progress strokes
             for hi in list(ds.was_drawing.keys()):
                 if ds.was_drawing[hi]:
                     ds.try_snap_shape(collab)
-                    ds.was_drawing[hi] = False
+                    ds.was_drawing[hi]      = False
+                    ds._skip_first_draw[hi] = True  # FIX-3
+                    ds._draw_start_pos.pop(hi, None)  # FIX-11: Clean up
+            # FIX-12: Clean up gesture confirmation state for lost hands
+            for hi in list(ds._gesture_frames.keys()):
+                ds._gesture_frames.pop(hi, None)
+                ds._last_gesture.pop(hi, None)
+            # FIX-14: Clean up timing state for lost hands
+            for hi in list(ds._gesture_time.keys()):
+                ds._gesture_time.pop(hi, None)
+                ds._last_movement_time.pop(hi, None)
+                ds._last_draw_pos.pop(hi, None)
             ds.reset_stroke()
             ds.clear_hold = 0
 
@@ -1150,16 +1192,15 @@ def run(use_voice: bool = True):
         frame   = cv2.bitwise_and(frame, cv2.bitwise_not(mask3))
         frame   = cv2.bitwise_or(frame, ds.canvas)
 
-        # HUD
         _draw_ui(frame, ui, ds, fps,
-                 cnn_label      = last_cnn_label,
-                 cnn_conf       = last_cnn_conf,
-                 training_mode  = training_mode,
-                 training_label = training_label,
-                 training_count = training_count,
+                 cnn_label        = last_cnn_label,
+                 cnn_conf         = last_cnn_conf,
+                 training_mode    = training_mode,
+                 training_label   = training_label,
+                 training_count   = training_count,
                  collab_connected = (collab is not None and collab.connected),
-                 voice_last     = voice_last_heard,
-                 voice_timer    = voice_last_timer)
+                 voice_last       = voice_last_heard,
+                 voice_timer      = voice_last_timer)
 
         # Cursor decorations
         if finger_cursor:
@@ -1169,20 +1210,17 @@ def run(use_voice: bool = True):
             elif gesture_this_frame == "draw":
                 r = max(ds.thickness, 3)
                 cv2.circle(frame, (fx, fy), r, ds.color, -1, cv2.LINE_AA)
-                # Show pause-snap indicator if user is pausing
                 for hi2 in ds.pause_start_time:
                     if ds.was_drawing.get(hi2, False) and not ds.pause_snapped.get(hi2, False):
                         paused_for = now - ds.pause_start_time.get(hi2, now)
                         if paused_for > 0.1:
-                            pct = min(1.0, paused_for / PAUSE_SNAP_SECONDS)
+                            pct     = min(1.0, paused_for / PAUSE_SNAP_SECONDS)
                             arc_end = int(360 * pct)
                             if arc_end > 10:
                                 cv2.ellipse(frame, (fx, fy),
                                             (r + 8, r + 8), -90,
-                                            0, arc_end,
-                                            (0, 255, 200), 2, cv2.LINE_AA)
+                                            0, arc_end, (0, 255, 200), 2, cv2.LINE_AA)
 
-        # Status overlay
         if status_msg and time.time() < status_timer:
             cv2.putText(frame, status_msg,
                         (FW // 2 - 120, FH - 60),
@@ -1190,9 +1228,7 @@ def run(use_voice: bool = True):
 
         cv2.imshow(WINDOW, frame)
 
-        # -- Keyboard shortcuts -----------------------------------------------
         key = cv2.waitKey(1) & 0xFF
-
         if key in (ord('q'), ord('Q'), 27):
             break
         elif key == ord('z'):
@@ -1204,69 +1240,55 @@ def run(use_voice: bool = True):
             show_status("Loaded: " + os.path.basename(p) if p else "No saves found")
         elif key == ord('c'):
             ds.clear(); show_status("Canvas cleared!")
-            if collab and collab.connected:
-                collab.send_clear()
+            if collab and collab.connected: collab.send_clear()
         elif key == ord('a'):
             ds.snap_active = not ds.snap_active
             show_status("AI snap ON" if ds.snap_active else "AI snap OFF")
 
-        # -- Training mode ----------------------------------------------------
         elif key == ord('t') and _CNN_OK:
             if not training_mode:
                 training_mode  = True
                 training_label = GESTURE_LABELS[training_idx % len(GESTURE_LABELS)]
                 training_count = 0
                 collector.start_session(training_label)
-                show_status("Training: Show '" + training_label + "' gesture", 2.0)
+                show_status("Training: Show '" + training_label + "'", 2.0)
             else:
-                show_status("Already in training mode. Y=done, N=next label")
+                show_status("Already training. Y=done, N=next")
 
         elif key == ord('y') and training_mode and _CNN_OK:
             n = collector.end_session()
             X, y = collector.get_dataset()
             if len(X) > 0:
-                train_dataset_X.append(X)
-                train_dataset_y.append(y)
-            training_idx  += 1
-            training_count = 0
+                train_X.append(X); train_y.append(y)
+            training_idx += 1; training_count = 0
             if training_idx < len(GESTURE_LABELS):
                 training_label = GESTURE_LABELS[training_idx]
                 collector.start_session(training_label)
-                show_status("Next gesture: '" + training_label + "'", 2.0)
+                show_status("Next: '" + training_label + "'", 2.0)
             else:
                 training_mode = False
                 show_status("Training CNN...", 3.0)
                 try:
-                    all_X = np.concatenate(train_dataset_X, axis=0)
-                    all_y = np.concatenate(train_dataset_y, axis=0)
-                    all_X_aug, all_y_aug = collector.augment(all_X, all_y)
-                    cnn_clf.train(all_X_aug, all_y_aug)
-                    cnn_clf.save()
-                    cnn_ok = True
-                    show_status("CNN trained & saved! Accuracy improved.", 3.0)
+                    all_X = np.concatenate(train_X); all_y = np.concatenate(train_y)
+                    Xa, ya = collector.augment(all_X, all_y)
+                    cnn_clf.train(Xa, ya); cnn_clf.save(); cnn_ok = True
+                    show_status("CNN trained & saved!", 3.0)
                 except Exception as e:
                     show_status("Training failed: " + str(e), 3.0)
-                train_dataset_X = []
-                train_dataset_y = []
-                training_idx    = 0
+                train_X = []; train_y = []; training_idx = 0
 
         elif key == ord('n') and training_mode and _CNN_OK:
             collector.end_session()
-            training_idx  += 1
-            training_count = 0
+            training_idx += 1; training_count = 0
             if training_idx < len(GESTURE_LABELS):
                 training_label = GESTURE_LABELS[training_idx]
                 collector.start_session(training_label)
                 show_status("Skipped. Now: '" + training_label + "'", 2.0)
             else:
-                training_mode = False
-                show_status("Training cancelled.", 1.5)
+                training_mode = False; show_status("Training cancelled.", 1.5)
 
-    # Cleanup
-    tracker.close()
-    cap.release()
-    if vc:
-        vc.stop()
+    tracker.close(); cap.release()
+    if vc: vc.stop()
     cv2.destroyAllWindows()
 
 

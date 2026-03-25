@@ -316,6 +316,11 @@ class GestureClassifier:
             return classify_gesture(hand_landmarks, hand_label), 0.0
 
         vec = landmarks_to_vector(hand_landmarks)
+        if vec is None:
+            # Invalid/corrupted landmarks (NaN/degenerate/low-visibility) —
+            # fall back to rule-based so real-time inference doesn't crash.
+            rule_label = classify_gesture(hand_landmarks, hand_label)
+            return rule_label, 1.0
 
         try:
             if self._backend == "torch":
@@ -384,6 +389,10 @@ class GestureDataCollector:
         if self._current_label < 0:
             raise RuntimeError("Call start_session() first.")
         vec = landmarks_to_vector(hand_landmarks)
+        if vec is None:
+            # Skip invalid samples (prevents training-set corruption).
+            return self._session_count
+
         self._X.append(vec)
         self._y.append(self._current_label)
         self._session_count += 1
@@ -414,12 +423,21 @@ class GestureDataCollector:
         Light augmentation: add Gaussian noise to each sample n_copies times.
         This prevents over-fitting when the collected dataset is small.
         """
+        def _renormalize(vecs: np.ndarray) -> np.ndarray:
+            # Mirror landmarks_to_vector() normalization: max absolute coordinate = 1.
+            mx = np.max(np.abs(vecs), axis=1, keepdims=True)
+            mx = np.where(mx > 1e-9, mx, 1.0).astype(np.float32)
+            return (vecs / mx).astype(np.float32)
+
         extras_X, extras_y = [], []
         for _ in range(n_copies):
             noise = np.random.normal(0, noise_std, X.shape).astype(np.float32)
-            extras_X.append(X + noise)
+            aug = X + noise
+            aug = _renormalize(aug)
+            extras_X.append(aug)
             extras_y.append(y)
-        X_aug = np.concatenate([X] + extras_X, axis=0)
+
+        X_aug = np.concatenate([_renormalize(X)] + extras_X, axis=0)
         y_aug = np.concatenate([y] + extras_y, axis=0)
         shuffle = np.random.permutation(len(y_aug))
         return X_aug[shuffle], y_aug[shuffle]
@@ -511,21 +529,43 @@ def generate_synthetic_samples(n_per_class: int = 200,
         "erase":     [False, True,  True,  False, False],
         "select":    [False, True,  True,  True,  False],
         "open_palm": [True,  True,  True,  True,  True],
+        # Make each class distinct. In particular, pinch must differ from fist.
         "fist":      [False, False, False, False, False],
         "thumbs_up": [True,  False, False, False, False],
-        "pinch":     [False, False, False, False, False],  # special: thumb+index close
-        "ok":        [False, True,  True,  True,  True],   # index partially bent
+        # "pinch" is special: we will later force thumb tip & index tip proximity.
+        "pinch":     [True,  True,  False, False, False],
+        # "ok" is special: we force thumb tip close to index tip while other fingers are up.
+        "ok":        [False, True,  True,  True,  True],
         "idle":      [True,  True,  False, True,  True],
     }
 
     X_list, y_list = [], []
     for label, pat in patterns.items():
-        proto = _hand(pat)
+        proto = _hand(pat).reshape(21, 3)
+
+        # Gesture-specific landmark shaping so classes become learnable from 63-d vectors.
+        if label == "pinch":
+            # Bring thumb tip (4) close to index tip (8); keep other fingers curled by pat.
+            thumb_tip = proto[4].copy()
+            index_tip = proto[8].copy()
+            mid = (thumb_tip + index_tip) / 2.0
+            # Pull both tips toward midpoint to make them close regardless of initial hand pose.
+            proto[4] = mid + (thumb_tip - mid) * 0.15
+            proto[8] = mid + (index_tip - mid) * 0.15
+        elif label == "ok":
+            # Force thumb tip close to index tip, while keeping middle/ring/pinky extended via pat.
+            thumb_tip = proto[4].copy()
+            index_tip = proto[8].copy()
+            mid = (thumb_tip + index_tip) / 2.0
+            proto[4] = mid + (thumb_tip - mid) * 0.12
+            proto[8] = mid + (index_tip - mid) * 0.12
+
+        proto = proto.flatten()
         cls   = GESTURE_LABELS.index(label)
         for _ in range(n_per_class):
             # OPTIMIZED: Generate base sample with noise
             sample = proto + rng.normal(0, noise, 63).astype(np.float32)
-            # Renormalise
+            # Renormalise (keeps inference compatibility)
             mx = np.max(np.abs(sample)) + 1e-9
             sample /= mx
             

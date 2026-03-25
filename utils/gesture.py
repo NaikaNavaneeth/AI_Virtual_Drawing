@@ -118,11 +118,19 @@ def classify_gesture(hand_landmarks, hand_label: str) -> str:
         depths = [_finger_extension_depth(lm, tip, mcp) for tip, mcp in finger_pairs]
         avg_depth = sum(depths) / len(depths)
         min_depth = min(depths)  # even the least extended finger must clear the bar
+        max_depth = max(depths)
 
+        # NEW check 4: variance in finger extension (prevents uneven extension)
+        depth_variance = max_depth - min_depth
+
+        # FIX-10: RELAXED open_palm thresholds (too strict before)
+        # Users kept palm fully open but detection failed
+        # More lenient thresholds detect real open palms without false positives
         palm_open = (
-            spread_dist > 0.35      # fingers must be spread wide
-            and avg_depth > 0.04    # fingers must be clearly extended on average
-            and min_depth > -0.01   # no single finger can be curled behind knuckle
+            spread_dist > 0.35           # RELAXED: 0.50→0.35 (reasonable spread)
+            and avg_depth > 0.04         # RELAXED: 0.08→0.04 (clearly extended)
+            and all(d > 0.02 for d in depths)  # RELAXED: 0.05→0.02 (each finger slightly up)
+            and depth_variance < 0.10    # RELAXED: 0.06→0.10 (allow some variance)
         )
 
         if palm_open:

@@ -9,6 +9,12 @@ import os
 import time
 import numpy as np
 
+# Ensure unicode symbols in this script can be printed under Windows.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 print("=" * 80)

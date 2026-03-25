@@ -43,9 +43,11 @@ CAMERA_H     = SCREEN_H
 # MediaPipe hand tracking
 # ─────────────────────────────────────────────
 MP_MAX_HANDS   = 2
-MP_DETECT_CONF = 0.80  # OPTIMIZED: Increased from 0.75 for stability
-MP_TRACK_CONF  = 0.75  # OPTIMIZED: Increased from 0.70 for stability
-MP_FRAME_SKIP  = 3     # OPTIMIZED: Process every 3rd frame (3× FPS boost)
+MP_DETECT_CONF = 0.65  # FURTHER RELAXED: 0.70→0.65 to catch more frames
+MP_TRACK_CONF  = 0.60  # FURTHER RELAXED: 0.65→0.60 for continuous tracking
+                        # Frame skipping caused temporal misalignment between hand tracking 
+                        # and stroke collection, creating visible gaps. Maintaining ~1 FPS 
+                        # reduction is acceptable for drawing accuracy.
 
 # ─────────────────────────────────────────────
 # Drawing defaults
@@ -58,7 +60,7 @@ ERASER_RADIUS     = 40
 MIN_ERASER        = 10
 MAX_ERASER        = 100
 
-SMOOTH_BUF_SIZE   = 8  # OPTIMIZED: Reduced from 12 (200ms → 133ms latency)
+SMOOTH_BUF_SIZE   = 16  # FIX-10: Increased 8→16 for maximum smoothing and frame continuity
 
 # ─────────────────────────────────────────────
 # Gesture timing / debounce

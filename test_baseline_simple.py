@@ -12,6 +12,13 @@ import sys
 import os
 import numpy as np
 
+# Windows default console encoding is often cp1252, which can't print some
+# unicode glyphs used in this script (e.g., ✓ / ✗). Force UTF-8 if possible.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 print("=" * 80)

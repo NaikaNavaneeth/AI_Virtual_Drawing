@@ -1,1 +1,7 @@
 venv/
+assets/
+core/__pycache__/
+3d_module/
+ml/__pycache__/
+modules/__pycache__/
+utils/__pycache__/

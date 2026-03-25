@@ -12,7 +12,9 @@ from ml.drawing_mlp import DrawingMLP
 from utils.shape_ai import _bounding_box, _make_circle, _make_rectangle, _make_triangle, _make_line
 
 IMG_SIZE = 28
-CONFIDENCE_THRESHOLD = 0.80
+# PERMANENT FIX: Lowered confidence threshold to enable more shape/letter recognition
+# Was 0.80 (too strict), now 0.65 (more lenient while still filtering noise)
+CONFIDENCE_THRESHOLD = 0.65
 
 # --- Singleton Classifier Instance ---
 _classifier = None

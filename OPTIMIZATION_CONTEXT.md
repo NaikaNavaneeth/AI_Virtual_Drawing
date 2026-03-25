@@ -391,5 +391,18 @@ python test_phase3_quick.py          # Model validation
 
 ---
 
+## 2026-03-25: Stability & Snap Fixes (Post-Review)
+
+This update focuses on correctness and runtime stability in the ML → inference → snap pipeline:
+
+- `ml/gesture_cnn.py`: real-time gesture inference and in-app training now safely handle invalid landmark vectors (skip/route to rule-based fallback instead of crashing).
+- `ml/gesture_cnn.py`: gesture augmentation now re-normalizes vectors to match the same preprocessing used at inference time (max-abs scaling), reducing distribution drift.
+- `ml/gesture_cnn.py`: synthetic gesture generation now makes `pinch` distinct from `fist` by explicitly forcing thumb/index tip proximity; this improves learnability of the 9-class vocabulary.
+- `modules/drawing_2d.py`: temporal gesture smoothing is now confidence-weighted instead of plain majority vote, reducing jitter on uncertain predictions.
+- `modules/drawing_2d.py`: shape snap erasing now uses a black fill to avoid leaving “white box” artifacts behind.
+- `modules/drawing_2d.py`: letter/digit snapping is now functional via lightweight glyph template matching (A–Z, 0–9) on the drawn ROI.
+- `modules/drawing_2d.py`: fixed an off-by-one padding bug in `_snap_to_letter` that caused ROI broadcast shape errors in the 2D module.
+- `ml/drawing_cnn.py`: fixed a runtime issue by adding the missing `numpy` import.
+
 **Last Updated**: September 6, 2024  
 **Status**: ✅ PRODUCTION READY
