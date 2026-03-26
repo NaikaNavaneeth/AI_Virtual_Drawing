@@ -327,7 +327,7 @@ class DrawingState:
         self._STOP_CONFIRMATION_FRAMES = 2
 
         # ── Sketch Position Control ──────────────────────────────────────────
-        # Enable gesture-based shape repositioning (closed fist grab and move)
+        # Enable gesture-based shape repositioning (closed thumbs_up grab and move)
         self.sketch_move_enabled = True
         self.gesture_activator = GestureActivator(hold_duration_sec=2.5)
         self.shape_tracker = ShapeTracker()
@@ -348,8 +348,24 @@ class DrawingState:
             self.canvas = self.undo_stack.pop().copy()
 
     def clear(self):
+        """
+        Clear canvas and all associated sketch/shape data.
+        Also resets shape tracker and stops any active shape movement.
+        """
         self.push_undo()
         self.canvas[:] = 0
+        
+        # Clear all tracked shapes when canvas is cleared
+        self.shape_tracker.clear_all()
+        
+        # Reset any active shape movement state
+        self.is_moving_shape = False
+        self.current_moving_shape_id = None
+        self.shape_move_timeout = 0.0
+        
+        # Reset gesture activator to prevent stale grab attempts
+        if hasattr(self, 'gesture_activator'):
+            self.gesture_activator.reset()
 
     def reset_stroke(self):
         """
@@ -452,6 +468,11 @@ class DrawingState:
                     if patch is not None:
                         self._apply_letter_snap(letter, patch)
 
+        # FIX-17: Register freehand stroke BEFORE clearing buffers
+        # If no shape was snapped, register the freehand stroke for movement
+        if shape is None:
+            self._register_freehand_stroke(collab_client)
+        
         self.current_stroke.clear()
         self._stroke_buf_for_smooth.clear()
 
@@ -570,6 +591,50 @@ class DrawingState:
         self.snap_feedback = "Snapped: " + label
         self.snap_timer    = time.time() + 1.5
 
+    def _register_freehand_stroke(self, collab_client=None):
+        """
+        Register a freehand stroke as a movable shape.
+        Called when a stroke doesn't match any geometric shapes.
+        Allows users to grab and move any drawn stroke.
+        """
+        if not self._stroke_buf_for_smooth or len(self._stroke_buf_for_smooth) < _MIN_SNAP_PTS:
+            return
+        
+        # Calculate bounding box from stroke points
+        xs = [p[0] for p in self._stroke_buf_for_smooth]
+        ys = [p[1] for p in self._stroke_buf_for_smooth]
+        x_min, x_max = min(xs), max(xs)
+        y_min, y_max = min(ys), max(ys)
+        
+        w = x_max - x_min
+        h = y_max - y_min
+        center_x = x_min + w // 2
+        center_y = y_min + h // 2
+        
+        # Store stroke points for redrawing
+        stroke_points = [(int(p[0]), int(p[1])) for p in self._stroke_buf_for_smooth]
+        
+        # Create shape data for freehand stroke
+        shape_data = {
+            'id': str(__import__('uuid').uuid4()),
+            'type': 'freehand',
+            'original_pos': (center_x, center_y),
+            'current_pos': (center_x, center_y),
+            'center': (center_x, center_y),
+            'bounding_box': (x_min, y_min, x_max, y_max),
+            'size': (w, h),
+            'rotation': 0,
+            'stroke_points': stroke_points,  # Store actual stroke path
+            'color': self.color,
+            'thickness': self.thickness,
+            'timestamp': time.time(),
+            'moved': False,
+            'move_count': 0,
+        }
+        
+        # Register in shape tracker
+        self.shape_tracker.add_shape(shape_data)
+
     def apply_peer_event(self, msg: dict):
         t = msg.get("type")
         if t == "draw":
@@ -609,6 +674,7 @@ class DrawingState:
     def redraw_shape_at_position(self, shape: Dict[str, Any], old_pos: Tuple[int, int]):
         """
         Erase a shape from its old position and redraw at new position on canvas.
+        Uses mask-based erasing to properly handle antialiasing and thick lines.
         
         Args:
             shape: Shape data dictionary from tracker
@@ -624,13 +690,57 @@ class DrawingState:
         color = shape.get('color', self.color)
         thickness = shape.get('thickness', self.thickness)
         
-        # Erase from old position (black rectangle)
-        cv2.rectangle(self.canvas,
-                     (int(ox - w//2), int(oy - h//2)),
-                     (int(ox + w//2), int(oy + h//2)),
-                     (0, 0, 0), -1)
+        # Add padding to ensure complete erasure (handles antialiasing + thickness)
+        padding = thickness + 5
         
-        # Redraw at new position
+        # Create mask for old shape location (for complete erasure)
+        erase_mask = np.zeros((self.h, self.w), dtype=np.uint8)
+        
+        if shape_type == "circle":
+            cv2.circle(erase_mask, (int(ox), int(oy)), 
+                      int(w//2) + padding, 255, -1)
+        elif shape_type == "rectangle":
+            cv2.rectangle(erase_mask,
+                         (int(ox - w//2 - padding), int(oy - h//2 - padding)),
+                         (int(ox + w//2 + padding), int(oy + h//2 + padding)),
+                         255, -1)
+        elif shape_type == "triangle":
+            p1 = (int(ox), int(oy - h//2 - padding))
+            p2 = (int(ox - w//2 - padding), int(oy + h//2 + padding))
+            p3 = (int(ox + w//2 + padding), int(oy + h//2 + padding))
+            pts = np.array([p1, p2, p3], dtype=np.int32).reshape((-1, 1, 2))
+            cv2.fillPoly(erase_mask, [pts], 255)
+        elif shape_type == "line":
+            cv2.line(erase_mask, (int(ox), int(oy)), (int(nx), int(ny)),
+                    255, thickness + padding, cv2.LINE_AA)
+        elif shape_type == "freehand":
+            # For freehand strokes, erase the bounding box area
+            stroke_points = shape.get('stroke_points', [])
+            if stroke_points:
+                # Draw the stroke path on erase mask with padding
+                for i in range(1, len(stroke_points)):
+                    p1 = stroke_points[i-1]
+                    p2 = stroke_points[i]
+                    # Translate from original position to old position
+                    dx = ox - shape.get('original_pos', (ox, oy))[0]
+                    dy = oy - shape.get('original_pos', (ox, oy))[1]
+                    cv2.line(erase_mask,
+                            (int(p1[0] + dx), int(p1[1] + dy)),
+                            (int(p2[0] + dx), int(p2[1] + dy)),
+                            255, thickness + padding, cv2.LINE_AA)
+            else:
+                # Fallback: erase bounding box if no stroke points
+                cv2.rectangle(erase_mask,
+                            (int(ox - w//2 - padding), int(oy - h//2 - padding)),
+                            (int(ox + w//2 + padding), int(oy + h//2 + padding)),
+                            255, -1)
+        
+        # Apply mask-based erasure: clear old shape region
+        erase_mask_inv = cv2.bitwise_not(erase_mask)
+        erase_mask_3ch = cv2.cvtColor(erase_mask_inv, cv2.COLOR_GRAY2BGR)
+        self.canvas = cv2.bitwise_and(self.canvas, erase_mask_3ch)
+        
+        # Draw shape at new position
         if shape_type == "circle":
             cv2.circle(self.canvas, (int(nx), int(ny)), int(w//2),
                       color, thickness, lineType=cv2.LINE_AA)
@@ -649,6 +759,23 @@ class DrawingState:
         elif shape_type == "line":
             cv2.line(self.canvas, (int(ox), int(oy)), (int(nx), int(ny)),
                     color, thickness, lineType=cv2.LINE_AA)
+        elif shape_type == "freehand":
+            # For freehand strokes, redraw the path at new position
+            stroke_points = shape.get('stroke_points', [])
+            if stroke_points:
+                # Calculate offset from original center to new center
+                orig_pos = shape.get('original_pos', (nx, ny))
+                dx = nx - orig_pos[0]
+                dy = ny - orig_pos[1]
+                
+                # Redraw stroke path translated to new position
+                for i in range(1, len(stroke_points)):
+                    p1 = stroke_points[i-1]
+                    p2 = stroke_points[i]
+                    cv2.line(self.canvas,
+                            (int(p1[0] + dx), int(p1[1] + dy)),
+                            (int(p2[0] + dx), int(p2[1] + dy)),
+                            color, thickness, lineType=cv2.LINE_AA)
 
 
 # =============================================================================
@@ -1037,26 +1164,29 @@ def run(use_voice: bool = True):
                 if training_mode and collector:
                     training_count = collector.record(lm)
 
-                ix, iy      = fingertip_px(lm, FW, FH, finger=1)
+                # FIX-16: Use correct finger position based on gesture
+                # thumbs_up: use thumb (0), others: use index (1)
+                tracking_finger = 0 if gesture == "thumbs_up" else 1
+                ix, iy      = fingertip_px(lm, FW, FH, finger=tracking_finger)
                 finger_cursor = (ix, iy)
                 was_prev    = ds.was_drawing.get(hi, False)
 
                 # ── Button zone ──────────────────────────────────────────────
                 # ENHANCEMENT: Support index, middle, and ring fingers for UI selection
-                # Key fix: Allow button clicks even during active drawing if finger is in UI area
+                # FIX-19: Check for button hits BEFORE gesture processing
+                # This ensures button responsiveness regardless of gesture state
                 button_action_taken = False
-                if gesture == "draw":  # Allow button clicks anytime in draw gesture
+                if now >= btn_cooldown:
                     # Try each of the three fingers (index=1, middle=2, ring=3) for UI hit
                     for test_finger in [1, 2, 3]:
                         test_x, test_y = fingertip_px(lm, FW, FH, finger=test_finger)
                         if test_y < UI_H:  # Finger is in UI area (0-160px from top)
-                            if now >= btn_cooldown:
-                                action, payload = ui.hit(test_x, test_y)
-                                if action:
-                                    btn_cooldown = now + GESTURE_COOLDOWN
-                                    _apply_action(action, payload, ds, show_status, collab)
-                                    button_action_taken = True
-                                    break  # Stop checking other fingers after successful hit
+                            action, payload = ui.hit(test_x, test_y)
+                            if action:
+                                btn_cooldown = now + GESTURE_COOLDOWN
+                                _apply_action(action, payload, ds, show_status, collab)
+                                button_action_taken = True
+                                break  # Stop checking other fingers after successful hit
                     
                     if button_action_taken:
                         # Reset drawing state when button clicked
@@ -1093,11 +1223,11 @@ def run(use_voice: bool = True):
                     ds._skip_first_draw[hi] = True  # FIX-3: guard next draw start
 
                 # ── Sketch Position Control ──────────────────────────────────
-                # Closed fist gesture: grab and move shapes
-                elif gesture == "fist":
-                    # Update gesture activator
+                # Closed thumbs_up gesture: grab and move shapes
+                elif gesture == "thumbs_up":
+                    # Update gesture activator for thumbs_up (show to grab shape)
                     is_activated = ds.gesture_activator.update(
-                        "fist", is_fist=True, current_time=now
+                        "thumbs_up", is_fist=False, current_time=now
                     )
                     progress = ds.gesture_activator.get_hold_progress(now)
                     
@@ -1107,7 +1237,7 @@ def run(use_voice: bool = True):
                     )
                     
                     
-                    if gesture == "fist" and not ds.is_moving_shape:
+                    if gesture == "thumbs_up" and not ds.is_moving_shape:
                         # Activation confirmed - start moving the most recent shape
                         shape = ds.shape_tracker.get_most_recent()
                         
@@ -1133,17 +1263,23 @@ def run(use_voice: bool = True):
                             shape = ds.shape_tracker.get_by_id(ds.current_moving_shape_id)
                             
                             if shape and new_pos:
+                                # Save old position before updating
+                                old_pos = shape.get('current_pos', shape.get('center', (ix, iy)))
+                                
                                 # Apply boundary constraints
                                 final_pos = ds.boundary_manager.clamp_position(
                                     shape, new_pos[0], new_pos[1]
                                 )
                                 
-                                # Update shape position
+                                # Update shape position in tracker
                                 ds.shape_tracker.update_shape(shape['id'], {
                                     'current_pos': final_pos,
                                     'center': final_pos,
                                     'moved': True
                                 })
+                                
+                                # FIX: Redraw shape at new position on canvas
+                                ds.redraw_shape_at_position(shape, old_pos)
 
                 # ── Erase ────────────────────────────────────────────────────
                 elif gesture == "erase":
@@ -1173,63 +1309,47 @@ def run(use_voice: bool = True):
                 # ── Draw ─────────────────────────────────────────────────────
                 elif gesture == "draw" and not button_action_taken:
                     # FIX-15: Immediate gesture-based drawing (no timing delays)
-                    # Draw starts immediately when "draw" gesture is detected
-                    # No need for idle timeout - user controls drawing with gesture transitions
+                    # FIX-20: Eliminate drawing delay by removing threshold requirement
+                    # Draw starts immediately with NO DISTANCE requirement
+                    # Prevents jittery/delayed line rendering
                     
                     if iy > UI_H:  # Only draw when BELOW UI area
-                        # FIX-13: Skip first frame after position reset (hard stop)
-                        if ds.prev_x is None:
-                            ds.prev_x, ds.prev_y = ix, iy
-                            if not was_prev:
-                                ds._draw_start_pos[hi] = (ix, iy)
-                                ds.was_drawing[hi] = True
-                                ds.push_undo()
-                                ds.pause_last_pos[hi]   = (ix, iy)
-                                ds.pause_start_time[hi] = now
-                                ds.pause_snapped[hi]    = False
-                        elif not was_prev:
+                        # Initialize drawing state on first frame
+                        if not was_prev:
                             ds._draw_start_pos[hi] = (ix, iy)
                             ds.was_drawing[hi] = True
                             ds.push_undo()
                             ds.pause_last_pos[hi]   = (ix, iy)
                             ds.pause_start_time[hi] = now
                             ds.pause_snapped[hi]    = False
+                            ds.prev_x = ix
+                            ds.prev_y = iy
                         
-                        if was_prev:
-                            # Check movement distance from draw start
-                            start_x, start_y = ds._draw_start_pos.get(hi, (ix, iy))
-                            dist = abs(ix - start_x) + abs(iy - start_y)
-                            
-                            if dist >= ds._DRAW_THRESHOLD:
-                                # Threshold exceeded - start actual drawing
-                                prev_x = ds.prev_x or ix
-                                prev_y = ds.prev_y or iy
-                                ds.draw_point(ix, iy)
-                                if collab and collab.connected:
-                                    collab.send_stroke(ix, iy, prev_x, prev_y,
-                                                       ds.color, ds.thickness)
+                        # FIX-20: Start drawing IMMEDIATELY without threshold wait
+                        # Append point and draw it right away
+                        ds.draw_point(ix, iy)
+                        if collab and collab.connected:
+                            prev_x = ds.prev_x if ds.prev_x is not None else ix
+                            prev_y = ds.prev_y if ds.prev_y is not None else iy
+                            collab.send_stroke(ix, iy, prev_x, prev_y,
+                                             ds.color, ds.thickness)
 
-                                # Pause-to-snap
-                                if ds.snap_active and not ds.pause_snapped.get(hi, False):
-                                    last_px, last_py = ds.pause_last_pos.get(hi, (ix, iy))
-                                    moved = abs(ix - last_px) + abs(iy - last_py)
-                                    if moved > PAUSE_MOVE_THRESHOLD:
-                                        ds.pause_last_pos[hi]   = (ix, iy)
-                                        ds.pause_start_time[hi] = now
-                                    else:
-                                        paused_for = now - ds.pause_start_time.get(hi, now)
-                                        if paused_for >= PAUSE_SNAP_SECONDS and len(ds.current_stroke) >= _MIN_SNAP_PTS:
-                                            ds.push_undo()
-                                            ds.try_snap_shape(collab)
-                                            ds.pause_snapped[hi]    = True
-                                            ds.was_drawing[hi]      = False
-                                            ds._draw_start_pos.pop(hi, None)
-                                            ds.reset_stroke()
+                        # Pause-to-snap detection
+                        if ds.snap_active and not ds.pause_snapped.get(hi, False):
+                            last_px, last_py = ds.pause_last_pos.get(hi, (ix, iy))
+                            moved = abs(ix - last_px) + abs(iy - last_py)
+                            if moved > PAUSE_MOVE_THRESHOLD:
+                                ds.pause_last_pos[hi]   = (ix, iy)
+                                ds.pause_start_time[hi] = now
                             else:
-                                # Still within threshold - just update smooth buffer position
-                                ds.smooth_buf.push(ix, iy)
-                                ds.prev_x, ds.prev_y = ix, iy
-                                ds.current_stroke.append((ix, iy))
+                                paused_for = now - ds.pause_start_time.get(hi, now)
+                                if paused_for >= PAUSE_SNAP_SECONDS and len(ds.current_stroke) >= _MIN_SNAP_PTS:
+                                    ds.push_undo()
+                                    ds.try_snap_shape(collab)
+                                    ds.pause_snapped[hi]    = True
+                                    ds.was_drawing[hi]      = False
+                                    ds._draw_start_pos.pop(hi, None)
+                                    ds.reset_stroke()
                     else:
                         # Finger moved to UI area - stop drawing
                         if was_prev:
@@ -1275,6 +1395,14 @@ def run(use_voice: bool = True):
                 ds._last_gesture.pop(hi, None)
             ds.reset_stroke()
             ds.clear_hold = 0
+
+        # ── Release Shape on Gesture Change ──────────────────────────────
+        # If we're moving a shape but gesture is no longer "thumbs_up", release it
+        if gesture_this_frame != "thumbs_up" and ds.is_moving_shape:
+            ds.is_moving_shape = False
+            ds.movement_controller.end_move()
+            if hasattr(ds, 'gesture_activator'):
+                ds.gesture_activator.reset()
 
         # Merge canvas onto frame
         gray    = cv2.cvtColor(ds.canvas, cv2.COLOR_BGR2GRAY)

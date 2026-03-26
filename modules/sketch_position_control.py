@@ -101,7 +101,7 @@ class GestureActivator:
             current_time = time.time()
         
         # Fist gesture begins
-        if is_fist and current_gesture == "fist":
+        if is_fist and current_gesture == "thumbs_up":
             if self.hold_start_time is None:
                 self.hold_start_time = current_time
             
@@ -752,7 +752,7 @@ if __name__ == "__main__":
         
         # Simulate closed fist for first 75 frames (~2.5 seconds)
         is_fist = i < 75
-        gesture = "fist" if is_fist else "idle"
+        gesture = "thumbs_up" if is_fist else "idle"
         
         activated = gesture_activator.update(gesture, is_fist, current_time)
         progress = gesture_activator.get_hold_progress(current_time)

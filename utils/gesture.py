@@ -88,8 +88,9 @@ def classify_gesture(hand_landmarks, hand_label: str) -> str:
     fup = fingers_up(hand_landmarks, hand_label)
     thumb, index, middle, ring, pinky = fup
 
-    # -- Draw: only index finger up -------------------------------------------
-    if index and not middle and not ring and not pinky:
+    # -- Draw: only index finger up (thumb must be down) ----------------------
+    # FIX-18: Explicitly require thumb to be down to prevent confusion with thumbs_up
+    if index and not thumb and not middle and not ring and not pinky:
         return "draw"
 
     # -- Erase: index + middle up ---------------------------------------------
