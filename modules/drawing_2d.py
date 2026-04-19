@@ -74,6 +74,15 @@ from modules.sketch_position_control import (
     BoundaryManager, VisualIndicators, create_shape_data
 )
 
+# RL-based universal shape/letter recognition (NEW FIX-24)
+try:
+    from utils.universal_classifier import UniversalShapeClassifier
+    from modules.rl_ui import RLFeedbackUI, RL_LearningUI
+    from utils.learning_manager import LearningManager
+    _RL_ENABLED = True
+except ImportError:
+    _RL_ENABLED = False
+
 # CNN classifier (graceful degradation if torch/sklearn missing)
 try:
     from ml.gesture_cnn import GestureClassifier, GestureDataCollector
@@ -339,6 +348,40 @@ class DrawingState:
         self.is_moving_shape = False
         self.shape_move_timeout = 0.0
         self.current_moving_shape_id: Optional[str] = None
+        
+        # ── Shape Mapping (Rough → Clean) ────────────────────────────────────
+        # Enable learnable shape correction using CNN
+        self.shape_mapper = None
+        self.use_shape_mapping = False
+        try:
+            from ml.shape_mapper import ShapeMapperInference
+            self.shape_mapper = ShapeMapperInference()
+            self.use_shape_mapping = self.shape_mapper.is_loaded
+            if self.use_shape_mapping:
+                print("[DrawingState] Shape mapping CNN enabled")
+            else:
+                print("[DrawingState] Shape mapping CNN not available (model not trained)")
+        except Exception as e:
+            print(f"[DrawingState] Shape mapping initialization failed: {e}")
+        
+        # ── Reinforcement Learning (FIX-24: Universal shape/letter recognition) ──
+        # Enable RL-based shape/letter classification with continuous learning
+        self.universal_classifier = None
+        self.rl_feedback_ui = None
+        self.learning_manager = None
+        self.rl_enabled = False
+        self._pending_rl_feedback = None  # (ClassificationResult, callback_fn)
+        
+        if _RL_ENABLED:
+            try:
+                self.universal_classifier = UniversalShapeClassifier()
+                self.rl_feedback_ui = RLFeedbackUI(h, w)
+                self.learning_manager = LearningManager()
+                self.rl_enabled = True
+                print("[DrawingState] RL-based universal shape/letter recognition enabled")
+            except Exception as e:
+                print(f"[DrawingState] RL initialization failed: {e}")
+                self.rl_enabled = False
 
     def push_undo(self):
         if len(self.undo_stack) >= UNDO_LIMIT:
@@ -379,6 +422,167 @@ class DrawingState:
         self.prev_x = self.prev_y = None   # FIX-3: explicit cursor reset
         self.current_stroke.clear()
         self._stroke_buf_for_smooth.clear()
+
+    def _improve_stroke_with_cnn(self, stroke_pts):
+        """
+        Apply learnable shape mapping (CNN) to improve rough sketch quality.
+        
+        Converts stroke to 28x28 image, applies the trained mapper to clean
+        it up, then extracts improved points from the cleaned image.
+        
+        Args:
+            stroke_pts: Original rough stroke points
+            
+        Returns:
+            Improved stroke points (same origin, cleaned up)
+        """
+        if not self.use_shape_mapping or self.shape_mapper is None:
+            return stroke_pts
+        
+        try:
+            # 1. Create 28x28 image from stroke
+            xs = [p[0] for p in stroke_pts]
+            ys = [p[1] for p in stroke_pts]
+            x_min, x_max = min(xs), max(xs)
+            y_min, y_max = min(ys), max(ys)
+            w = max(x_max - x_min, 1)
+            h = max(y_max - y_min, 1)
+            
+            # Create canvas and draw stroke
+            stroke_canvas = np.zeros((28, 28), dtype=np.uint8)
+            pts_normalized = [(int((p[0] - x_min) * 27 / max(w, 1)), 
+                              int((p[1] - y_min) * 27 / max(h, 1))) for p in stroke_pts]
+            
+            if len(pts_normalized) > 1:
+                for i in range(1, len(pts_normalized)):
+                    cv2.line(stroke_canvas, pts_normalized[i-1], pts_normalized[i], 255, 1)
+            
+            # 2. Apply CNN mapping
+            clean_img_28x28 = self.shape_mapper.map_rough_to_clean(stroke_canvas)
+            if clean_img_28x28 is None:
+                return stroke_pts
+            
+            # 3. Extract points from cleaned image
+            # Find white pixels (shape pixels)
+            contours, _ = cv2.findContours(clean_img_28x28, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                return stroke_pts
+            
+            # Get the largest contour
+            contour = max(contours, key=cv2.contourArea)
+            if contour.shape[0] < 5:  # Too few points
+                return stroke_pts
+            
+            # 4. Convert back to original coordinate space
+            approx = cv2.approxPolyDP(contour, 1, True)
+            improved_pts = []
+            
+            for point in approx:
+                x_norm = point[0][0] / 27.0 if point[0][0] > 0 else 0
+                y_norm = point[0][1] / 27.0 if point[0][1] > 0 else 0
+                
+                x_orig = x_min + x_norm * w
+                y_orig = y_min + y_norm * h
+                
+                improved_pts.append((int(x_orig), int(y_orig)))
+            
+            if len(improved_pts) > 3:
+                return improved_pts
+            else:
+                return stroke_pts
+                
+        except Exception as e:
+            # Graceful fallback if CNN mapping fails
+            print(f"[ShapeSnap] CNN improvement failed: {e}")
+            return stroke_pts
+    
+    # ──────────────────────────────────────────────────────────────────────────
+    # RL-Based Universal Shape/Letter Recognition (FIX-24)
+    # ──────────────────────────────────────────────────────────────────────────
+    
+    def _detect_shape_with_rl(self) -> Optional[Tuple[str, str, float]]:
+        """
+        Detect shape/letter using RL-enhanced universal classifier.
+        
+        FIX: Increased confidence threshold from 0.3 to 0.75 to prevent
+        rough sketches from being incorrectly snapped to shapes.
+        Only high-confidence predictions will snap.
+        
+        Returns:
+            (category, label, confidence) or None if detection fails
+        """
+        if not self.rl_enabled or not self.universal_classifier or len(self.current_stroke) < _MIN_SNAP_PTS:
+            return None
+        
+        try:
+            result = self.universal_classifier.classify(self.current_stroke)
+            # FIX: Increase threshold from 0.3 to 0.75 to avoid false positives
+            # Rough sketches will now fall through to freehand registration
+            if result and result.confidence > 0.75:  # HIGH confidence threshold
+                print(f"[RL] High-confidence detection: {result.label} ({result.confidence:.2f})")
+                return (result.category, result.label, result.confidence)
+            elif result:
+                print(f"[RL] Low-confidence prediction ignored: {result.label} ({result.confidence:.2f})")
+        except Exception as e:
+            print(f"[RL] Classification failed: {e}")
+        
+        return None
+    
+    def _show_rl_feedback(self, prediction_result):
+        """
+        Show prediction to user and wait for feedback.
+        
+        Args:
+            prediction_result: ClassificationResult from universal classifier
+        """
+        if not self.rl_feedback_ui:
+            return
+        
+        # Callback for feedback
+        def on_feedback(accepted: bool, correction: Optional[str]):
+            if self.universal_classifier:
+                correct_label = None if accepted else correction
+                self.universal_classifier.record_feedback(
+                    prediction_result,
+                    correct_label=correct_label,
+                    user_accepted=accepted,
+                    timestamp=time.time()
+                )
+                
+                if accepted:
+                    print(f"✓ Confirmed: {prediction_result.label}")
+                else:
+                    print(f"✗ Corrected: {prediction_result.label} → {correction}")
+        
+        # Show the feedback UI
+        self._pending_rl_feedback = (prediction_result, on_feedback)
+    
+    def _handle_rl_keyboard_feedback(self, key: int) -> bool:
+        """
+        Handle keyboard input for RL feedback.
+        
+        Args:
+            key: OpenCV key code
+            
+        Returns:
+            True if feedback was processed
+        """
+        if not hasattr(self, '_pending_rl_feedback') or self._pending_rl_feedback is None:
+            return False
+        
+        if self.rl_feedback_ui:
+            return self.rl_feedback_ui.handle_feedback(key)
+        
+        return False
+    
+    def _print_rl_statistics(self):
+        """Print learning statistics to console."""
+        if not self.learning_manager:
+            print("[RL] No learning data yet")
+            return
+        
+        report = self.learning_manager.analyze_feedback()
+        self.learning_manager.print_report(report)
 
     def draw_point(self, x: int, y: int):
         """
@@ -430,8 +634,13 @@ class DrawingState:
     def try_snap_shape(self, collab_client=None):
         """
         On stroke end: try unified shape snapping with fallback chain.
-        FIX-6: Added _MIN_SNAP_PTS guard on the rule-based path.
-        FIX-21: Ensure freehand registration happens for non-geometric strokes
+        
+        Detection priority (FIX-24: Added RL-based universal classifier):
+        1. Rule-based geometric detector (highest reliability)
+        2. MLP shape classifier
+        3. RL-based universal classifier (can handle any shape/letter)
+        4. Legacy letter snapper (fallback)
+        5. Freehand registration (last resort)
         """
         if not self.snap_active or len(self.current_stroke) < _MIN_SNAP_PTS:
             self.current_stroke.clear()
@@ -441,30 +650,46 @@ class DrawingState:
         shape     = None
         clean_pts = None
 
-        # Priority 1: rule-based (more reliable)
+        # Priority 1: rule-based geometric detector (most reliable)
         shape, clean_pts = detect_and_snap(self.current_stroke)
 
         if shape and clean_pts:
             self._apply_shape_snap(shape, clean_pts, collab_client)
         else:
-            # Priority 2: MLP
+            # Priority 2: MLP detector
             try:
                 shape, clean_pts = detect_and_snap_mlp(
                     self.current_stroke, (self.h, self.w))
                 if shape and clean_pts:
                     self._apply_shape_snap(shape, clean_pts, collab_client)
                 else:
-                    result = _snap_to_letter(
-                        self.current_stroke, (self.h, self.w),
-                        self.color, self.thickness)
-                    if result:
-                        letter, patch = result
-                        if patch is not None:
-                            self._apply_letter_snap(letter, patch)
-                    # FIX-21: Ensure shape is reset for freehand registration
-                    shape = None
+                    # Priority 3: RL-based universal classifier (NEW FIX-24)
+                    rl_result = self._detect_shape_with_rl()
+                    if rl_result:
+                        category, label, confidence = rl_result
+                        # For RL-detected shapes, convert to standard format
+                        if category == "shapes":
+                            self._apply_shape_snap(label, self.current_stroke, collab_client)
+                            # Show prediction for feedback
+                            try:
+                                pred = self.universal_classifier.classify(self.current_stroke)
+                                self._show_rl_feedback(pred)
+                            except:
+                                pass
+                        shape = label  # Mark as snapped
+                    else:
+                        # Priority 4: Legacy letter snapping (fallback)
+                        result = _snap_to_letter(
+                            self.current_stroke, (self.h, self.w),
+                            self.color, self.thickness)
+                        if result:
+                            letter, patch = result
+                            if patch is not None:
+                                self._apply_letter_snap(letter, patch)
+                        # FIX-21: Ensure shape is reset for freehand registration
+                        shape = None
             except Exception as e:
-                print(f"[Shape] MLP detection failed: {e}")
+                print(f"[Shape] Detection failed: {e}")
                 result = _snap_to_letter(
                     self.current_stroke, (self.h, self.w),
                     self.color, self.thickness)
@@ -490,6 +715,8 @@ class DrawingState:
         - Perfect positioning (centroid correctness)
         - Rotation preservation (for rectangles/triangles)
         - Zero distortion (uses proper geometric fitting, not bounding box)
+        
+        NEW: Applies learnable shape mapping (CNN) to improve rough stroke quality before fitting.
         """
         if not self.current_stroke:
             return
@@ -510,13 +737,17 @@ class DrawingState:
 
         # FIX-11: Increase thickness during shape snap for better visibility
         snap_thickness = max(self.thickness + 1, 4)
+        
+        # FIX-JHC: Apply learnable shape mapping before fitting
+        # This improves rough stroke quality using the trained CNN
+        improved_stroke = self._improve_stroke_with_cnn(self.current_stroke)
 
         # NEW: Use advanced shape fitting for perfect mapping
         fit_result = None
         center_x, center_y = x_orig + w_orig // 2, y_orig + h_orig // 2
         
         if shape == "circle":
-            fit_result = fit_circle(self.current_stroke)
+            fit_result = fit_circle(improved_stroke)
             if fit_result and fit_result.get('quality', 0) > 0.3:
                 center_x, center_y = fit_result['center']
                 radius = int(fit_result['radius'])
@@ -529,7 +760,7 @@ class DrawingState:
                            self.color, snap_thickness, lineType=cv2.LINE_AA)
                            
         elif shape == "rectangle":
-            fit_result = fit_rectangle(self.current_stroke)
+            fit_result = fit_rectangle(improved_stroke)
             if fit_result and len(fit_result.get('corners', [])) == 4:
                 corners = fit_result['corners']
                 # Convert to int points for cv2.polylines
@@ -545,9 +776,12 @@ class DrawingState:
                               (x_orig, y_orig),
                               (x_orig + w_orig, y_orig + h_orig),
                               self.color, snap_thickness, lineType=cv2.LINE_AA)
+                # FIX-29: Update center for fallback rectangle (so it can be grabbed)
+                center_x = x_orig + w_orig // 2
+                center_y = y_orig + h_orig // 2
                               
         elif shape == "triangle":
-            fit_result = fit_triangle(self.current_stroke)
+            fit_result = fit_triangle(improved_stroke)
             if fit_result and len(fit_result.get('corners', [])) == 3:
                 corners = fit_result['corners']
                 corner_pts = np.array([(int(x), int(y)) for x, y in corners],
@@ -565,9 +799,12 @@ class DrawingState:
                 cv2.polylines(self.canvas, [pts], isClosed=True,
                               color=self.color, thickness=snap_thickness,
                               lineType=cv2.LINE_AA)
+                # FIX-29: Update center for fallback triangle (so it can be grabbed)
+                center_x = (p1[0] + p2[0] + p3[0]) // 3
+                center_y = (p1[1] + p2[1] + p3[1]) // 3
                               
         elif shape == "line":
-            fit_result = fit_line(self.current_stroke)
+            fit_result = fit_line(improved_stroke)
             if fit_result:
                 start = fit_result['start']
                 end = fit_result['end']
@@ -581,6 +818,9 @@ class DrawingState:
                 if len(clean) >= 2:
                     cv2.line(self.canvas, clean[0], clean[-1],
                              self.color, snap_thickness, lineType=cv2.LINE_AA)
+                    # FIX-29: Update center for fallback line (so it can be grabbed)
+                    center_x = (clean[0][0] + clean[-1][0]) // 2
+                    center_y = (clean[0][1] + clean[-1][1]) // 2
         else:
             # Generic freehand shape
             clean = [(int(p[0]), int(p[1])) for p in clean_pts]
@@ -613,6 +853,21 @@ class DrawingState:
             color=self.color,
             thickness=self.thickness
         )
+        
+        # FIX-30: Store fitted corners as relative offsets for rectangles/triangles
+        # This allows repositioning rotated shapes correctly (not just axis-aligned)
+        # FIX-31: Handle both "rectangle" and "square" types
+        if shape in ("rectangle", "square") and fit_result and len(fit_result.get('corners', [])) == 4:
+            corners = fit_result['corners']
+            # Store corners as relative offsets from center for later repositioning
+            corner_offsets = [(int(cx - center_x), int(cy - center_y)) for cx, cy in corners]
+            shape_data['corner_offsets'] = corner_offsets
+        
+        elif shape == "triangle" and fit_result and len(fit_result.get('corners', [])) == 3:
+            corners = fit_result['corners']
+            # Store corners as relative offsets from center for later repositioning
+            corner_offsets = [(int(cx - center_x), int(cy - center_y)) for cx, cy in corners]
+            shape_data['corner_offsets'] = corner_offsets
         
         # FIX: Store line endpoints relative to center for proper repositioning
         if shape == "line" and clean_pts and len(clean_pts) >= 2:
@@ -771,37 +1026,58 @@ class DrawingState:
         if shape_type == "circle":
             cv2.circle(erase_mask, (int(ox), int(oy)), 
                       int(w//2) + padding, 255, -1)
-        elif shape_type == "rectangle":
-            cv2.rectangle(erase_mask,
-                         (int(ox - w//2 - padding), int(oy - h//2 - padding)),
-                         (int(ox + w//2 + padding), int(oy + h//2 + padding)),
-                         255, -1)
+        elif shape_type in ("rectangle", "square"):  # FIX-31: Handle both types
+            # FIX-30: Use stored corner offsets if available (for rotated rectangles)
+            corner_offsets = shape.get('corner_offsets', None)
+            if corner_offsets and len(corner_offsets) == 4:
+                # Erase using stored corner offsets
+                corners_old = [(int(ox + ox_off), int(oy + oy_off)) 
+                               for ox_off, oy_off in corner_offsets]
+                corner_pts = np.array(corners_old, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.fillPoly(erase_mask, [corner_pts], 255)
+                # Add padding border around the corners
+                cv2.polylines(erase_mask, [corner_pts], isClosed=True,
+                              color=255, thickness=padding, lineType=cv2.LINE_AA)
+            else:
+                # Fallback: erase axis-aligned rectangle
+                cv2.rectangle(erase_mask,
+                             (int(ox - w//2 - padding), int(oy - h//2 - padding)),
+                             (int(ox + w//2 + padding), int(oy + h//2 + padding)),
+                             255, -1)
         elif shape_type == "triangle":
-            p1 = (int(ox), int(oy - h//2 - padding))
-            p2 = (int(ox - w//2 - padding), int(oy + h//2 + padding))
-            p3 = (int(ox + w//2 + padding), int(oy + h//2 + padding))
-            pts = np.array([p1, p2, p3], dtype=np.int32).reshape((-1, 1, 2))
-            cv2.fillPoly(erase_mask, [pts], 255)
+            # FIX-30: Use stored corner offsets if available (for rotated triangles)
+            corner_offsets = shape.get('corner_offsets', None)
+            if corner_offsets and len(corner_offsets) == 3:
+                # Erase using stored corner offsets
+                corners_old = [(int(ox + ox_off), int(oy + oy_off)) 
+                               for ox_off, oy_off in corner_offsets]
+                corner_pts = np.array(corners_old, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.fillPoly(erase_mask, [corner_pts], 255)
+                # Add padding border around the corners
+                cv2.polylines(erase_mask, [corner_pts], isClosed=True,
+                              color=255, thickness=padding, lineType=cv2.LINE_AA)
+            else:
+                # Fallback: erase axis-aligned triangle
+                p1 = (int(ox), int(oy - h//2 - padding))
+                p2 = (int(ox - w//2 - padding), int(oy + h//2 + padding))
+                p3 = (int(ox + w//2 + padding), int(oy + h//2 + padding))
+                pts = np.array([p1, p2, p3], dtype=np.int32).reshape((-1, 1, 2))
+                cv2.fillPoly(erase_mask, [pts], 255)
         elif shape_type == "line":
             cv2.line(erase_mask, (int(ox), int(oy)), (int(nx), int(ny)),
                     255, thickness + padding, cv2.LINE_AA)
         elif shape_type == "freehand":
-            # For freehand strokes, erase the bounding box area
+            # For freehand strokes, erase the old position
             stroke_points = shape.get('stroke_points', [])
             if stroke_points:
-                # FIX-21: Stroke points are stored relative to original_pos
-                # So we translate them by the offset from original to old position
-                orig_pos = shape.get('original_pos', (ox, oy))
-                dx = ox - orig_pos[0]
-                dy = oy - orig_pos[1]
-                
-                # Draw the stroke path on erase mask with padding
+                # FIX-27: Stroke points are relative offsets from center
+                # Translate to old position (ox, oy) being erased
                 for i in range(1, len(stroke_points)):
                     p1 = stroke_points[i-1]
                     p2 = stroke_points[i]
                     cv2.line(erase_mask,
-                            (int(p1[0] + dx), int(p1[1] + dy)),
-                            (int(p2[0] + dx), int(p2[1] + dy)),
+                            (int(p1[0] + ox), int(p1[1] + oy)),
+                            (int(p2[0] + ox), int(p2[1] + oy)),
                             255, thickness + padding, cv2.LINE_AA)
             else:
                 # Fallback: erase bounding box if no stroke points
@@ -819,18 +1095,38 @@ class DrawingState:
         if shape_type == "circle":
             cv2.circle(self.canvas, (int(nx), int(ny)), int(w//2),
                       color, thickness, lineType=cv2.LINE_AA)
-        elif shape_type == "rectangle":
-            cv2.rectangle(self.canvas,
-                         (int(nx - w//2), int(ny - h//2)),
-                         (int(nx + w//2), int(ny + h//2)),
-                         color, thickness, lineType=cv2.LINE_AA)
+        elif shape_type in ("rectangle", "square"):  # FIX-31: Handle both types
+            # FIX-30: Use stored corner offsets if available (for rotated rectangles)
+            corner_offsets = shape.get('corner_offsets', None)
+            if corner_offsets and len(corner_offsets) == 4:
+                # Redraw at new position using stored corner offsets
+                corners_new = [(int(nx + ox), int(ny + oy)) for ox, oy in corner_offsets]
+                corner_pts = np.array(corners_new, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.polylines(self.canvas, [corner_pts], isClosed=True,
+                              color=color, thickness=thickness, lineType=cv2.LINE_AA)
+            else:
+                # Fallback: axis-aligned rectangle (no corner data stored)
+                cv2.rectangle(self.canvas,
+                             (int(nx - w//2), int(ny - h//2)),
+                             (int(nx + w//2), int(ny + h//2)),
+                             color, thickness, lineType=cv2.LINE_AA)
         elif shape_type == "triangle":
-            p1 = (int(nx), int(ny - h//2))
-            p2 = (int(nx - w//2), int(ny + h//2))
-            p3 = (int(nx + w//2), int(ny + h//2))
-            pts = np.array([p1, p2, p3], dtype=np.int32).reshape((-1, 1, 2))
-            cv2.polylines(self.canvas, [pts], isClosed=True,
-                         color=color, thickness=thickness, lineType=cv2.LINE_AA)
+            # FIX-30: Use stored corner offsets if available (for rotated triangles)
+            corner_offsets = shape.get('corner_offsets', None)
+            if corner_offsets and len(corner_offsets) == 3:
+                # Redraw at new position using stored corner offsets
+                corners_new = [(int(nx + ox), int(ny + oy)) for ox, oy in corner_offsets]
+                corner_pts = np.array(corners_new, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.polylines(self.canvas, [corner_pts], isClosed=True,
+                              color=color, thickness=thickness, lineType=cv2.LINE_AA)
+            else:
+                # Fallback: axis-aligned triangle (no corner data stored)
+                p1 = (int(nx), int(ny - h//2))
+                p2 = (int(nx - w//2), int(ny + h//2))
+                p3 = (int(nx + w//2), int(ny + h//2))
+                pts = np.array([p1, p2, p3], dtype=np.int32).reshape((-1, 1, 2))
+                cv2.polylines(self.canvas, [pts], isClosed=True,
+                             color=color, thickness=thickness, lineType=cv2.LINE_AA)
         elif shape_type == "line":
             # FIX: For line shapes, maintain the line geometry (just translate)
             # Store line endpoints relative to center in original_pos
@@ -854,19 +1150,15 @@ class DrawingState:
             # For freehand strokes, redraw the path at new position
             stroke_points = shape.get('stroke_points', [])
             if stroke_points:
-                # FIX-21: Stroke points are stored relative to original_pos
-                # Calculate offset from original position to new position
-                orig_pos = shape.get('original_pos', (nx, ny))
-                dx = nx - orig_pos[0]
-                dy = ny - orig_pos[1]
-                
-                # Redraw stroke path translated to current position
+                # FIX-27: Stroke points are stored relative offsets from center
+                # Apply directly to new position (nx, ny) not as delta
+                # Each stroke point: (relative_x + new_center_x, relative_y + new_center_y)
                 for i in range(1, len(stroke_points)):
                     p1 = stroke_points[i-1]
                     p2 = stroke_points[i]
                     cv2.line(self.canvas,
-                            (int(p1[0] + dx), int(p1[1] + dy)),
-                            (int(p2[0] + dx), int(p2[1] + dy)),
+                            (int(p1[0] + nx), int(p1[1] + ny)),
+                            (int(p2[0] + nx), int(p2[1] + ny)),
                             color, thickness, lineType=cv2.LINE_AA)
 
     def rebuild_all_shapes_on_canvas(self):
@@ -878,7 +1170,10 @@ class DrawingState:
         # Clear canvas and redraw all tracked shapes
         self.canvas = np.zeros((self.h, self.w, 3), dtype=np.uint8)
         
-        for shape in self.shape_tracker.shapes:
+        num_shapes = len(self.shape_tracker.shapes)
+        print(f"[REBUILD] Called - {num_shapes} shapes in tracker")
+        
+        for idx, shape in enumerate(self.shape_tracker.shapes):
             if not shape:
                 continue
             
@@ -889,48 +1184,81 @@ class DrawingState:
             thickness = shape.get('thickness', self.thickness)
             nx, ny = int(pos[0]), int(pos[1])
             
+            # DEBUG: Log what we're drawing
+            print(f"[REBUILD] Shape {idx}: {shape_type} at ({nx}, {ny}), size ({w}, {h}), color {color}, thickness {thickness}")
+            
             # Draw each shape type at its current position
             if shape_type == "circle":
                 cv2.circle(self.canvas, (nx, ny), int(w//2),
                           color, thickness, lineType=cv2.LINE_AA)
-            elif shape_type == "rectangle":
-                cv2.rectangle(self.canvas,
-                             (int(nx - w//2), int(ny - h//2)),
-                             (int(nx + w//2), int(ny + h//2)),
-                             color, thickness, lineType=cv2.LINE_AA)
+            elif shape_type in ("rectangle", "square"):  # FIX-31: Handle both types
+                try:
+                    # FIX-30: Use stored corner offsets if available (for rotated rectangles)
+                    corner_offsets = shape.get('corner_offsets', None)
+                    if corner_offsets and len(corner_offsets) == 4:
+                        # Draw using stored corner offsets
+                        corners_new = [(int(nx + ox), int(ny + oy)) for ox, oy in corner_offsets]
+                        corner_pts = np.array(corners_new, dtype=np.int32).reshape((-1, 1, 2))
+                        cv2.polylines(self.canvas, [corner_pts], isClosed=True,
+                                      color=color, thickness=thickness, lineType=cv2.LINE_AA)
+                    else:
+                        # Fallback: axis-aligned rectangle
+                        cv2.rectangle(self.canvas,
+                                     (int(nx - w//2), int(ny - h//2)),
+                                     (int(nx + w//2), int(ny + h//2)),
+                                     color, thickness, lineType=cv2.LINE_AA)
+                except Exception as e:
+                    print(f"[ERROR] Rectangle draw failed: {e}, shape={shape_type}, pos=({nx},{ny}), size=({w},{h})")
             elif shape_type == "triangle":
-                p1 = (int(nx), int(ny - h//2))
-                p2 = (int(nx - w//2), int(ny + h//2))
-                p3 = (int(nx + w//2), int(ny + h//2))
-                pts = np.array([p1, p2, p3], dtype=np.int32).reshape((-1, 1, 2))
-                cv2.polylines(self.canvas, [pts], isClosed=True,
-                             color=color, thickness=thickness, lineType=cv2.LINE_AA)
+                try:
+                    # FIX-30: Use stored corner offsets if available (for rotated triangles)
+                    corner_offsets = shape.get('corner_offsets', None)
+                    if corner_offsets and len(corner_offsets) == 3:
+                        # Draw using stored corner offsets
+                        corners_new = [(int(nx + ox), int(ny + oy)) for ox, oy in corner_offsets]
+                        corner_pts = np.array(corners_new, dtype=np.int32).reshape((-1, 1, 2))
+                        cv2.polylines(self.canvas, [corner_pts], isClosed=True,
+                                      color=color, thickness=thickness, lineType=cv2.LINE_AA)
+                    else:
+                        # Fallback: axis-aligned triangle
+                        p1 = (int(nx), int(ny - h//2))
+                        p2 = (int(nx - w//2), int(ny + h//2))
+                        p3 = (int(nx + w//2), int(ny + h//2))
+                        pts = np.array([p1, p2, p3], dtype=np.int32).reshape((-1, 1, 2))
+                        cv2.polylines(self.canvas, [pts], isClosed=True,
+                                     color=color, thickness=thickness, lineType=cv2.LINE_AA)
+                except Exception as e:
+                    print(f"[ERROR] Triangle draw failed: {e}")
             elif shape_type == "line":
-                line_points = shape.get('line_points', None)
-                if line_points and len(line_points) >= 2:
-                    p1_rel, p2_rel = line_points[0], line_points[1]
-                    p1_new = (int(p1_rel[0] + nx), int(p1_rel[1] + ny))
-                    p2_new = (int(p2_rel[0] + nx), int(p2_rel[1] + ny))
-                    cv2.line(self.canvas, p1_new, p2_new,
-                            color, thickness, lineType=cv2.LINE_AA)
-                else:
-                    cv2.line(self.canvas, (int(nx - w//2), int(ny)), 
-                            (int(nx + w//2), int(ny)),
-                            color, thickness, lineType=cv2.LINE_AA)
-            elif shape_type == "freehand":
-                stroke_points = shape.get('stroke_points', [])
-                if stroke_points:
-                    orig_pos = shape.get('original_pos', (nx, ny))
-                    dx = nx - orig_pos[0]
-                    dy = ny - orig_pos[1]
-                    
-                    for i in range(1, len(stroke_points)):
-                        p1 = stroke_points[i-1]
-                        p2 = stroke_points[i]
-                        cv2.line(self.canvas,
-                                (int(p1[0] + dx), int(p1[1] + dy)),
-                                (int(p2[0] + dx), int(p2[1] + dy)),
+                try:
+                    line_points = shape.get('line_points', None)
+                    if line_points and len(line_points) >= 2:
+                        p1_rel, p2_rel = line_points[0], line_points[1]
+                        p1_new = (int(p1_rel[0] + nx), int(p1_rel[1] + ny))
+                        p2_new = (int(p2_rel[0] + nx), int(p2_rel[1] + ny))
+                        cv2.line(self.canvas, p1_new, p2_new,
                                 color, thickness, lineType=cv2.LINE_AA)
+                    else:
+                        cv2.line(self.canvas, (int(nx - w//2), int(ny)), 
+                                (int(nx + w//2), int(ny)),
+                                color, thickness, lineType=cv2.LINE_AA)
+                except Exception as e:
+                    print(f"[ERROR] Line draw failed: {e}")
+            elif shape_type == "freehand":
+                try:
+                    stroke_points = shape.get('stroke_points', [])
+                    if stroke_points:
+                        # FIX-27b: Fix same delta bug in rebuild as in redraw
+                        # Stroke points are relative offsets - apply directly to current position
+                        for i in range(1, len(stroke_points)):
+                            p1 = stroke_points[i-1]
+                            p2 = stroke_points[i]
+                            cv2.line(self.canvas,
+                                    (int(p1[0] + nx), int(p1[1] + ny)),
+                                    (int(p2[0] + nx), int(p2[1] + ny)),
+                                    color, thickness, lineType=cv2.LINE_AA)
+                except Exception as e:
+                    print(f"[ERROR] Freehand draw failed: {e}")
 
 
 # =============================================================================
@@ -1186,8 +1514,8 @@ def run(use_voice: bool = True):
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
         print("ERROR: Camera not found at index " + str(CAMERA_INDEX)); sys.exit(1)
-    # FIX-13: Optimize FPS and resolution for better performance
-    cap.set(cv2.CAP_PROP_FPS, 30)
+    # FIX-26: Maximize FPS for responsive hand tracking (low latency)
+    cap.set(cv2.CAP_PROP_FPS, 60)  # INCREASED: 30→60 FPS for real-time responsiveness
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAMERA_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_H)
 
@@ -1254,6 +1582,10 @@ def run(use_voice: bool = True):
     # NEW: Temporal smoothing for frame gaps elimination
     temporal_smoothers = {}  # Per-hand smoothing to interpolate missing frames
     landmark_filters = {}     # Per-hand exponential filtering for jitter reduction
+    
+    # FIX-26b: Add separate hand position buffer for shape movement (more stable)
+    # Drawing uses high alpha (0.65) for responsiveness, but movement needs stability
+    hand_position_buffer = {}  # Per-hand: deque of last N positions for movement smoothing
 
     def show_status(msg, dur=1.5):
         nonlocal status_msg, status_timer
@@ -1296,8 +1628,8 @@ def run(use_voice: bool = True):
                 
                 # Initialize smoothers for this hand if needed
                 if hi not in temporal_smoothers:
-                    temporal_smoothers[hi] = LandmarkTemporalSmoother(history_size=2)
-                    landmark_filters[hi] = ExponentialLandmarkFilter(alpha=0.15)
+                    temporal_smoothers[hi] = LandmarkTemporalSmoother(history_size=1)  # FIX-26: Reduced buffering for responsiveness
+                    landmark_filters[hi] = ExponentialLandmarkFilter(alpha=0.65)  # FIX-26: 0.15→0.65 (65% current, 35% history = responsive)
                 
                 # Smooth landmarks using temporal interpolation
                 smoothed_hand = temporal_smoothers[hi].smooth(hand, hand_quality, time.time())
@@ -1384,6 +1716,11 @@ def run(use_voice: bool = True):
                         ds.is_moving_shape = False
                         ds.movement_controller.end_move()
                         show_status("Shape released.", 1.5)
+                        # FIX-28: Don't try to snap after rebuild - it will erase shapes
+                        # Mark that we just released a shape so we skip try_snap below
+                        released_shape_this_frame = True
+                    else:
+                        released_shape_this_frame = False
                     ds.gesture_activator.reset()  # FIX: Reset when gesture changes
                     
                     if not hasattr(ds, '_open_palm_streak'):
@@ -1403,7 +1740,10 @@ def run(use_voice: bool = True):
                     else:
                         ds.clear_hold = 0
 
-                    if was_prev:
+                    # FIX-28: Don't snap if we just released a shape - snap will destroy it
+                    if released_shape_this_frame:
+                        ds.reset_stroke()  # Just reset stroke, don't try to snap
+                    elif was_prev:
                         ds.try_snap_shape(collab)
                         ds.was_drawing[hi] = False
                     else:
@@ -1435,6 +1775,12 @@ def run(use_voice: bool = True):
                         shape = ds.shape_tracker.get_nearest(ix, iy, radius=120)
                         
                         if shape:
+                            # FIX-26b: Initialize position buffer for this hand (for smooth movement)
+                            if hi not in hand_position_buffer:
+                                hand_position_buffer[hi] = deque(maxlen=5)
+                            hand_position_buffer[hi].clear()
+                            hand_position_buffer[hi].append((ix, iy))
+                            
                             ds.movement_controller.start_move(
                                 shape['id'], ix, iy, shape['current_pos']
                             )
@@ -1451,8 +1797,23 @@ def run(use_voice: bool = True):
                             ds.movement_controller.end_move()
                             show_status("Shape released (timeout).", 2.0)
                         else:
-                            # Calculate new position based on hand movement
-                            new_pos = ds.movement_controller.calculate_new_position(ix, iy)
+                            # FIX-26b: Smooth hand position for stable shape movement
+                            # Use position buffer to reduce jitter (separate from drawing responsiveness)
+                            if hi not in hand_position_buffer:
+                                hand_position_buffer[hi] = deque(maxlen=5)  # Keep last 5 positions
+                            
+                            hand_position_buffer[hi].append((ix, iy))
+                            
+                            # Average last N positions for stability during movement
+                            if len(hand_position_buffer[hi]) > 0:
+                                avg_x = sum(p[0] for p in hand_position_buffer[hi]) / len(hand_position_buffer[hi])
+                                avg_y = sum(p[1] for p in hand_position_buffer[hi]) / len(hand_position_buffer[hi])
+                                ix_smooth, iy_smooth = int(avg_x), int(avg_y)
+                            else:
+                                ix_smooth, iy_smooth = ix, iy
+                            
+                            # Calculate new position based on smoothed hand movement
+                            new_pos = ds.movement_controller.calculate_new_position(ix_smooth, iy_smooth)
                             shape = ds.shape_tracker.get_by_id(ds.current_moving_shape_id)
                             
                             if shape and new_pos:

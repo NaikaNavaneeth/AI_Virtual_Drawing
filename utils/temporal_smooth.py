@@ -87,9 +87,9 @@ class LandmarkTemporalSmoother:
         
         prev_hand = list(self.history)[-1]['hand']
         
-        # Blend: 70% previous, 30% current low-quality detection
-        # This reduces jitter while keeping current detection in the loop
-        blended = self._interpolate_hands(prev_hand, current_hand, alpha=0.3)
+        # Blend: FIX-26 - Increased to 65% current, 35% previous
+        # More responsive to actual hand movement for real-time tracking
+        blended = self._interpolate_hands(prev_hand, current_hand, alpha=0.65)
         
         # Still add current to history to maintain continuity
         return blended

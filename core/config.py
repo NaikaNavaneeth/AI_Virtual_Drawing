@@ -43,11 +43,10 @@ CAMERA_H     = SCREEN_H
 # MediaPipe hand tracking
 # ─────────────────────────────────────────────
 MP_MAX_HANDS   = 2
-MP_DETECT_CONF = 0.65  # FURTHER RELAXED: 0.70→0.65 to catch more frames
-MP_TRACK_CONF  = 0.60  # FURTHER RELAXED: 0.65→0.60 for continuous tracking
-                        # Frame skipping caused temporal misalignment between hand tracking 
-                        # and stroke collection, creating visible gaps. Maintaining ~1 FPS 
-                        # reduction is acceptable for drawing accuracy.
+MP_DETECT_CONF = 0.60  # FIX-26: Optimized for real-time responsiveness
+MP_TRACK_CONF  = 0.55  # FIX-26: Lower threshold for continuous tracking at 60 FPS
+                        # Hand points now follow at 60 FPS with minimal latency
+                        # Increased frame catchrate for smooth hand tracking
 
 # ─────────────────────────────────────────────
 # Drawing defaults
