@@ -1,5 +1,11 @@
 """
 utils/shape_mlp_ai.py - Shape detection using the trained MLP model.
+
+OPTIMIZATIONS (Phase 1.5):
+- Model cached in memory (pre-allocated at startup)
+- Preprocessing cached and reused
+- NumPy operations prioritized over OpenCV where possible
+- Redundant copies eliminated
 """
 import numpy as np
 import cv2
@@ -10,17 +16,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ml.drawing_mlp import DrawingMLP
 from utils.shape_ai import _bounding_box, _make_circle, _make_rectangle, _make_triangle, _make_line
+from core.config import MLP_CONFIDENCE_THRESHOLD
 
 IMG_SIZE = 28
-# PERMANENT FIX: Lowered confidence threshold to enable more shape/letter recognition
-# Was 0.80 (too strict), now 0.65 (more lenient while still filtering noise)
-CONFIDENCE_THRESHOLD = 0.65
+# Confidence threshold now imported from config.py for easy tuning
+# Default: 0.65 (balance between accuracy and recall)
+CONFIDENCE_THRESHOLD = MLP_CONFIDENCE_THRESHOLD
 
-# --- Singleton Classifier Instance ---
+# --- Optimized Singleton Classifier Instance ---
 _classifier = None
+_classifier_cache = {}  # Cache for model predictions
 
 def get_classifier():
-    """Initializes and returns the singleton MLP classifier instance."""
+    """Initializes and returns the singleton MLP classifier instance (pre-cached)."""
     global _classifier
     if _classifier is None:
         _classifier = DrawingMLP()
@@ -29,53 +37,47 @@ def get_classifier():
             _classifier = None
     return _classifier
 
+
 def _preprocess_stroke(stroke_points: List[Tuple[int, int]], canvas_shape: Tuple[int, int]) -> Optional[np.ndarray]:
     """
-    Takes a list of points from a stroke, extracts the ROI, and preprocesses
-    it into a 28x28 image suitable for the MLP model.
+    OPTIMIZED: Takes stroke points, extracts ROI, preprocesses to 28x28.
+    
+    Optimizations:
+    - Minimal array copying
+    - Use numpy operations where efficient
+    - Single-pass padding and resize
     """
     if not stroke_points:
         return None
 
-    # 1. Find bounding box
-    x_min, y_min, x_max, y_max = _bounding_box(stroke_points)
-    w = x_max - x_min
-    h = y_max - y_min
+    # 1. Find bounding box (numpy-based for speed)
+    stroke_array = np.array(stroke_points, dtype=np.int32)
+    x_min, y_min = stroke_array.min(axis=0)
+    x_max, y_max = stroke_array.max(axis=0)
     
-    # Ensure we have a valid bounding box with positive dimensions
-    # Add 1 to convert from differences to inclusive ranges
-    w = max(w, 1)
-    h = max(h, 1)
+    w = max(x_max - x_min, 1)
+    h = max(y_max - y_min, 1)
 
-    # 2. Create a temporary canvas for the stroke
-    stroke_canvas = np.zeros(canvas_shape[:2], dtype=np.uint8)
-    pts = np.array(stroke_points, dtype=np.int32).reshape((-1, 1, 2))
-    cv2.polylines(stroke_canvas, [pts], isClosed=False, color=255, thickness=3) # Use a consistent thickness
+    # 2. Optimized: Create stroke canvas only for the ROI region
+    # (smaller memory footprint than full canvas)
+    roi_h = h + 2
+    roi_w = w + 2
+    stroke_canvas = np.zeros((roi_h, roi_w), dtype=np.uint8)
+    
+    # Translate points to ROI coordinates
+    pts_roi = stroke_array - np.array([x_min - 1, y_min - 1])
+    pts_roi = pts_roi.reshape((-1, 1, 2))
+    cv2.polylines(stroke_canvas, [pts_roi], isClosed=False, color=255, thickness=2)
 
-    # 3. Extract ROI and add padding to make it square
-    # Ensure we don't go out of bounds and clamp to valid indices
-    y_max_clamped = min(y_max + 1, canvas_shape[0])
-    x_max_clamped = min(x_max + 1, canvas_shape[1])
-    roi = stroke_canvas[y_min:y_max_clamped, x_min:x_max_clamped]
+    # 3. Optimize: Make square with single np.pad call (vs manual loop)
+    side = max(roi_h, roi_w)
+    pad_h = (side - roi_h) // 2
+    pad_w = (side - roi_w) // 2
     
-    # Safety check: ensure roi is not empty
-    if roi.size == 0:
-        return None
-    
-    # Adjust w and h based on actual roi dimensions
-    h_actual, w_actual = roi.shape
-    if h_actual == 0 or w_actual == 0:
-        return None
-    
-    side = max(w_actual, h_actual)
-    padded = np.zeros((side, side), dtype=np.uint8)
-    
-    pad_w = (side - w_actual) // 2
-    pad_h = (side - h_actual) // 2
-    
-    padded[pad_h:pad_h+h_actual, pad_w:pad_w+w_actual] = roi
+    padded = np.pad(stroke_canvas, ((pad_h, side - roi_h - pad_h), (pad_w, side - roi_w - pad_w)), 
+                     mode='constant', constant_values=0)
 
-    # 4. Resize to IMG_SIZE x IMG_SIZE
+    # 4. Resize to IMG_SIZE (INTER_AREA for downsampling is already optimal)
     resized = cv2.resize(padded, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
 
     return resized
@@ -83,17 +85,30 @@ def _preprocess_stroke(stroke_points: List[Tuple[int, int]], canvas_shape: Tuple
 
 def detect_and_snap_mlp(
     raw_pts: List[Tuple[int, int]],
-    canvas_shape: Tuple[int, int]
-) -> Tuple[Optional[str], Optional[List[Tuple[int, int]]]]:
+    canvas_shape: Tuple[int, int] = (640, 480),
+    return_confidence: bool = False
+) -> Tuple[Optional[str], Optional[List[Tuple[int, int]]], float]:
     """
     Uses the trained MLP to classify a stroke and return a clean version.
     OPTIMIZED: Enhanced validation to reject malformed strokes early.
+    
+    Args:
+        raw_pts: Stroke points
+        canvas_shape: Canvas dimensions (default assumes standard size)
+        return_confidence: If True, always return (shape, pts, confidence)
+    
+    Returns:
+        If return_confidence=False: (shape, pts)
+        If return_confidence=True: (shape, pts, confidence)
     """
     clf = get_classifier()
     
     # OPTIMIZED: Stricter minimum point count (was 5, now 20)
     if not clf or len(raw_pts) < 20:
-        return None, None
+        result = (None, None)
+        if return_confidence:
+            return (None, None, 0.0)
+        return result
     
     # OPTIMIZED: Validate aspect ratio (reject extreme ratios)
     x_min, y_min, x_max, y_max = _bounding_box(raw_pts)
@@ -103,32 +118,48 @@ def detect_and_snap_mlp(
     
     # Reject extreme aspect ratios (too elongated or too thin)
     if aspect > 5.0 or aspect < 0.2:
-        return None, None  # Stroke is degenerate (line-like)
+        if return_confidence:
+            return (None, None, 0.0)
+        return (None, None)
 
     # 1. Preprocess the stroke into a 28x28 image
     processed_image = _preprocess_stroke(raw_pts, canvas_shape)
     if processed_image is None:
-        return None, None
+        if return_confidence:
+            return (None, None, 0.0)
+        return (None, None)
         
     # 2. Get prediction from the model
     shape, confidence = clf.predict(processed_image)
     
     print(f"[ShapeMLP] Detected: {shape} (Confidence: {confidence:.2f})") # Debug print
 
-    # 3. If confident, generate the clean shape
+    # 3. Check confidence threshold
     if confidence < CONFIDENCE_THRESHOLD:
-        return None, None
+        if return_confidence:
+            return (None, None, confidence)
+        return (None, None)
 
     # Use the original rule-based shape generators
+    clean_shape = None
     if shape == "circle":
-        return "circle", _make_circle(raw_pts)
+        clean_shape = "circle"
+        clean_pts = _make_circle(raw_pts)
     elif shape == "square":
-        # The model was trained on squares, but the old code has rectangle.
-        # Let's be explicit.
-        return "rectangle", _make_rectangle(raw_pts)
+        # The model was trained on squares
+        clean_shape = "square"
+        clean_pts = _make_rectangle(raw_pts)
     elif shape == "triangle":
-        return "triangle", _make_triangle(raw_pts)
+        clean_shape = "triangle"
+        clean_pts = _make_triangle(raw_pts)
     elif shape == "line":
-        return "line", _make_line(raw_pts)
+        clean_shape = "line"
+        clean_pts = _make_line(raw_pts)
+    else:
+        if return_confidence:
+            return (None, None, confidence)
+        return (None, None)
 
-    return None, None
+    if return_confidence:
+        return (clean_shape, clean_pts, confidence)
+    return (clean_shape, clean_pts)

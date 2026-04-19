@@ -118,6 +118,15 @@ SHAPE_SCORE_MIN   = 0.55
 # ─────────────────────────────────────────────
 CNN_MODEL_PATH    = os.path.join(MODEL_DIR_ML, "gesture_cnn.pkl")
 CNN_INPUT_SIZE    = 63          # 21 landmarks × 3 (x,y,z), normalized
+CNN_CONFIDENCE    = 0.85        # CNN gesture confidence threshold
+
+# ─────────────────────────────────────────────
+# MLP Shape Detection Model
+# ─────────────────────────────────────────────
+MLP_MODEL_PATH           = os.path.join(MODEL_DIR_ML, "drawing_mlp.pkl")
+MLP_CONFIDENCE_THRESHOLD = 0.65  # Tunable: Higher=fewer detections, Lower=more detections
+                                 # Range: 0.55-0.75 recommended
+                                 # 0.65 = balance between accuracy and recall
 CNN_HIDDEN_SIZES  = [256, 128, 64]
 CNN_DROPOUT       = 0.3
 CNN_CONFIDENCE    = 0.85        # OPTIMIZED: Increased from 0.70 for stricter gesture recognition

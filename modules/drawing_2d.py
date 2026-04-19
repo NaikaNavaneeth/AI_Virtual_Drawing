@@ -67,6 +67,8 @@ from utils.mp_compat import HandTracker, DrawLandmarks, HAND_CONNECTIONS
 from utils.gesture import fingers_up, classify_gesture, fingertip_px
 from utils.shape_ai import sketch_to_3d, stroke_size, detect_and_snap
 from utils.shape_mlp_ai import detect_and_snap_mlp
+from utils.shape_fitting import fit_circle, fit_rectangle, fit_triangle, fit_line
+from utils.temporal_smooth import LandmarkTemporalSmoother, ExponentialLandmarkFilter
 from modules.sketch_position_control import (
     GestureActivator, ShapeTracker, MovementController,
     BoundaryManager, VisualIndicators, create_shape_data
@@ -429,6 +431,7 @@ class DrawingState:
         """
         On stroke end: try unified shape snapping with fallback chain.
         FIX-6: Added _MIN_SNAP_PTS guard on the rule-based path.
+        FIX-21: Ensure freehand registration happens for non-geometric strokes
         """
         if not self.snap_active or len(self.current_stroke) < _MIN_SNAP_PTS:
             self.current_stroke.clear()
@@ -458,6 +461,8 @@ class DrawingState:
                         letter, patch = result
                         if patch is not None:
                             self._apply_letter_snap(letter, patch)
+                    # FIX-21: Ensure shape is reset for freehand registration
+                    shape = None
             except Exception as e:
                 print(f"[Shape] MLP detection failed: {e}")
                 result = _snap_to_letter(
@@ -467,6 +472,8 @@ class DrawingState:
                     letter, patch = result
                     if patch is not None:
                         self._apply_letter_snap(letter, patch)
+                # FIX-21: Ensure shape is reset for freehand registration
+                shape = None
 
         # FIX-17: Register freehand stroke BEFORE clearing buffers
         # If no shape was snapped, register the freehand stroke for movement
@@ -477,7 +484,13 @@ class DrawingState:
         self._stroke_buf_for_smooth.clear()
 
     def _apply_shape_snap(self, shape: str, clean_pts, collab_client=None):
-        """Replace current rough stroke with a clean geometric shape."""
+        """Replace current rough stroke with a clean geometric shape using advanced fitting.
+        
+        Uses least-squares and PCA-based fitting to ensure:
+        - Perfect positioning (centroid correctness)
+        - Rotation preservation (for rectangles/triangles)
+        - Zero distortion (uses proper geometric fitting, not bounding box)
+        """
         if not self.current_stroke:
             return
 
@@ -498,33 +511,79 @@ class DrawingState:
         # FIX-11: Increase thickness during shape snap for better visibility
         snap_thickness = max(self.thickness + 1, 4)
 
-        # Draw clean shape
+        # NEW: Use advanced shape fitting for perfect mapping
+        fit_result = None
+        center_x, center_y = x_orig + w_orig // 2, y_orig + h_orig // 2
+        
         if shape == "circle":
-            radius = int(max(w_orig, h_orig) / 2)
-            cx     = x_orig + w_orig // 2
-            cy     = y_orig + h_orig // 2
-            cv2.circle(self.canvas, (cx, cy), radius,
-                       self.color, snap_thickness, lineType=cv2.LINE_AA)
+            fit_result = fit_circle(self.current_stroke)
+            if fit_result and fit_result.get('quality', 0) > 0.3:
+                center_x, center_y = fit_result['center']
+                radius = int(fit_result['radius'])
+                cv2.circle(self.canvas, (int(center_x), int(center_y)), radius,
+                           self.color, snap_thickness, lineType=cv2.LINE_AA)
+            else:
+                # Fallback if fitting fails
+                radius = int(max(w_orig, h_orig) / 2)
+                cv2.circle(self.canvas, (int(center_x), int(center_y)), radius,
+                           self.color, snap_thickness, lineType=cv2.LINE_AA)
+                           
         elif shape == "rectangle":
-            cv2.rectangle(self.canvas,
-                          (x_orig, y_orig),
-                          (x_orig + w_orig, y_orig + h_orig),
-                          self.color, snap_thickness, lineType=cv2.LINE_AA)
+            fit_result = fit_rectangle(self.current_stroke)
+            if fit_result and len(fit_result.get('corners', [])) == 4:
+                corners = fit_result['corners']
+                # Convert to int points for cv2.polylines
+                corner_pts = np.array([(int(x), int(y)) for x, y in corners], 
+                                      dtype=np.int32).reshape((-1, 1, 2))
+                cv2.polylines(self.canvas, [corner_pts], isClosed=True,
+                              color=self.color, thickness=snap_thickness,
+                              lineType=cv2.LINE_AA)
+                center_x, center_y = fit_result['center']
+            else:
+                # Fallback: simple rectangle
+                cv2.rectangle(self.canvas,
+                              (x_orig, y_orig),
+                              (x_orig + w_orig, y_orig + h_orig),
+                              self.color, snap_thickness, lineType=cv2.LINE_AA)
+                              
         elif shape == "triangle":
-            p1 = (x_orig + w_orig // 2, y_orig)
-            p2 = (x_orig, y_orig + h_orig)
-            p3 = (x_orig + w_orig, y_orig + h_orig)
-            pts = np.array([p1, p2, p3], dtype=np.int32).reshape((-1, 1, 2))
-            cv2.polylines(self.canvas, [pts], isClosed=True,
-                          color=self.color, thickness=snap_thickness,
-                          lineType=cv2.LINE_AA)
+            fit_result = fit_triangle(self.current_stroke)
+            if fit_result and len(fit_result.get('corners', [])) == 3:
+                corners = fit_result['corners']
+                corner_pts = np.array([(int(x), int(y)) for x, y in corners],
+                                      dtype=np.int32).reshape((-1, 1, 2))
+                cv2.polylines(self.canvas, [corner_pts], isClosed=True,
+                              color=self.color, thickness=snap_thickness,
+                              lineType=cv2.LINE_AA)
+                center_x, center_y = fit_result['center']
+            else:
+                # Fallback: simple triangle
+                p1 = (x_orig + w_orig // 2, y_orig)
+                p2 = (x_orig, y_orig + h_orig)
+                p3 = (x_orig + w_orig, y_orig + h_orig)
+                pts = np.array([p1, p2, p3], dtype=np.int32).reshape((-1, 1, 2))
+                cv2.polylines(self.canvas, [pts], isClosed=True,
+                              color=self.color, thickness=snap_thickness,
+                              lineType=cv2.LINE_AA)
+                              
         elif shape == "line":
-            clean = [(int(p[0]), int(p[1])) for p in clean_pts]
-            if len(clean) >= 2:
-                cv2.line(self.canvas, clean[0], clean[-1],
+            fit_result = fit_line(self.current_stroke)
+            if fit_result:
+                start = fit_result['start']
+                end = fit_result['end']
+                cv2.line(self.canvas, (int(start[0]), int(start[1])),
+                         (int(end[0]), int(end[1])),
                          self.color, snap_thickness, lineType=cv2.LINE_AA)
+                center_x, center_y = fit_result['center']
+            else:
+                # Fallback: endpoint line
+                clean = [(int(p[0]), int(p[1])) for p in clean_pts]
+                if len(clean) >= 2:
+                    cv2.line(self.canvas, clean[0], clean[-1],
+                             self.color, snap_thickness, lineType=cv2.LINE_AA)
         else:
-            clean   = [(int(p[0]), int(p[1])) for p in clean_pts]
+            # Generic freehand shape
+            clean = [(int(p[0]), int(p[1])) for p in clean_pts]
             pts_arr = np.array(clean, dtype=np.int32).reshape((-1, 1, 2))
             cv2.polylines(self.canvas, [pts_arr], isClosed=True,
                           color=self.color, thickness=snap_thickness,
@@ -546,16 +605,24 @@ class DrawingState:
 
         # ── Register Shape for Position Control ─────────────────────────
         # Track the snapped shape so user can grab and move it later
-        center_x = x_orig + w_orig // 2
-        center_y = y_orig + h_orig // 2
         shape_data = create_shape_data(
             shape_type=shape,
-            center_x=center_x,
-            center_y=center_y,
+            center_x=int(center_x),
+            center_y=int(center_y),
             size=(w_orig, h_orig),
             color=self.color,
             thickness=self.thickness
         )
+        
+        # FIX: Store line endpoints relative to center for proper repositioning
+        if shape == "line" and clean_pts and len(clean_pts) >= 2:
+            # Calculate line endpoints relative to center
+            p1 = clean_pts[0]
+            p2 = clean_pts[-1]
+            p1_rel = (p1[0] - center_x, p1[1] - center_y)
+            p2_rel = (p2[0] - center_x, p2[1] - center_y)
+            shape_data['line_points'] = [p1_rel, p2_rel]
+        
         self.shape_tracker.add_shape(shape_data)
 
     def _apply_letter_snap(self, label: str, patch: np.ndarray):
@@ -611,8 +678,13 @@ class DrawingState:
         center_x = x_min + w // 2
         center_y = y_min + h // 2
         
-        # Store stroke points for redrawing
-        stroke_points = [(int(p[0]), int(p[1])) for p in self._stroke_buf_for_smooth]
+        # FIX-21: Store stroke points as RELATIVE offsets from center
+        # This ensures correct repositioning when shape is moved
+        # Each point is stored as (x - center_x, y - center_y)
+        stroke_points = [
+            (int(p[0] - center_x), int(p[1] - center_y)) 
+            for p in self._stroke_buf_for_smooth
+        ]
         
         # Create shape data for freehand stroke
         shape_data = {
@@ -624,7 +696,7 @@ class DrawingState:
             'bounding_box': (x_min, y_min, x_max, y_max),
             'size': (w, h),
             'rotation': 0,
-            'stroke_points': stroke_points,  # Store actual stroke path
+            'stroke_points': stroke_points,  # Store as relative offsets
             'color': self.color,
             'thickness': self.thickness,
             'timestamp': time.time(),
@@ -717,13 +789,16 @@ class DrawingState:
             # For freehand strokes, erase the bounding box area
             stroke_points = shape.get('stroke_points', [])
             if stroke_points:
+                # FIX-21: Stroke points are stored relative to original_pos
+                # So we translate them by the offset from original to old position
+                orig_pos = shape.get('original_pos', (ox, oy))
+                dx = ox - orig_pos[0]
+                dy = oy - orig_pos[1]
+                
                 # Draw the stroke path on erase mask with padding
                 for i in range(1, len(stroke_points)):
                     p1 = stroke_points[i-1]
                     p2 = stroke_points[i]
-                    # Translate from original position to old position
-                    dx = ox - shape.get('original_pos', (ox, oy))[0]
-                    dy = oy - shape.get('original_pos', (ox, oy))[1]
                     cv2.line(erase_mask,
                             (int(p1[0] + dx), int(p1[1] + dy)),
                             (int(p2[0] + dx), int(p2[1] + dy)),
@@ -757,18 +832,35 @@ class DrawingState:
             cv2.polylines(self.canvas, [pts], isClosed=True,
                          color=color, thickness=thickness, lineType=cv2.LINE_AA)
         elif shape_type == "line":
-            cv2.line(self.canvas, (int(ox), int(oy)), (int(nx), int(ny)),
-                    color, thickness, lineType=cv2.LINE_AA)
+            # FIX: For line shapes, maintain the line geometry (just translate)
+            # Store line endpoints relative to center in original_pos
+            line_points = shape.get('line_points', None)
+            if line_points and len(line_points) >= 2:
+                # Get relative endpoints stored during snapping
+                p1_rel = line_points[0]
+                p2_rel = line_points[1]
+                # Translate endpoints based on new position
+                p1_new = (p1_rel[0] + nx, p1_rel[1] + ny)
+                p2_new = (p2_rel[0] + nx, p2_rel[1] + ny)
+                cv2.line(self.canvas, (int(p1_new[0]), int(p1_new[1])), 
+                        (int(p2_new[0]), int(p2_new[1])),
+                        color, thickness, lineType=cv2.LINE_AA)
+            else:
+                # Fallback: if no line_points stored, use bounding box center
+                cv2.line(self.canvas, (int(nx - w//2), int(ny)), 
+                        (int(nx + w//2), int(ny)),
+                        color, thickness, lineType=cv2.LINE_AA)
         elif shape_type == "freehand":
             # For freehand strokes, redraw the path at new position
             stroke_points = shape.get('stroke_points', [])
             if stroke_points:
-                # Calculate offset from original center to new center
+                # FIX-21: Stroke points are stored relative to original_pos
+                # Calculate offset from original position to new position
                 orig_pos = shape.get('original_pos', (nx, ny))
                 dx = nx - orig_pos[0]
                 dy = ny - orig_pos[1]
                 
-                # Redraw stroke path translated to new position
+                # Redraw stroke path translated to current position
                 for i in range(1, len(stroke_points)):
                     p1 = stroke_points[i-1]
                     p2 = stroke_points[i]
@@ -776,6 +868,69 @@ class DrawingState:
                             (int(p1[0] + dx), int(p1[1] + dy)),
                             (int(p2[0] + dx), int(p2[1] + dy)),
                             color, thickness, lineType=cv2.LINE_AA)
+
+    def rebuild_all_shapes_on_canvas(self):
+        """
+        Rebuild all shapes currently in tracker onto canvas.
+        Used after releasing a moved shape to ensure clean final rendering.
+        More efficient than redraw_shape_at_position for multiple shapes.
+        """
+        # Clear canvas and redraw all tracked shapes
+        self.canvas = np.zeros((self.h, self.w, 3), dtype=np.uint8)
+        
+        for shape in self.shape_tracker.shapes:
+            if not shape:
+                continue
+            
+            pos = shape.get('current_pos', shape.get('center', (0, 0)))
+            w, h = shape.get('size', (50, 50))
+            shape_type = shape.get('type', 'rectangle')
+            color = shape.get('color', self.color)
+            thickness = shape.get('thickness', self.thickness)
+            nx, ny = int(pos[0]), int(pos[1])
+            
+            # Draw each shape type at its current position
+            if shape_type == "circle":
+                cv2.circle(self.canvas, (nx, ny), int(w//2),
+                          color, thickness, lineType=cv2.LINE_AA)
+            elif shape_type == "rectangle":
+                cv2.rectangle(self.canvas,
+                             (int(nx - w//2), int(ny - h//2)),
+                             (int(nx + w//2), int(ny + h//2)),
+                             color, thickness, lineType=cv2.LINE_AA)
+            elif shape_type == "triangle":
+                p1 = (int(nx), int(ny - h//2))
+                p2 = (int(nx - w//2), int(ny + h//2))
+                p3 = (int(nx + w//2), int(ny + h//2))
+                pts = np.array([p1, p2, p3], dtype=np.int32).reshape((-1, 1, 2))
+                cv2.polylines(self.canvas, [pts], isClosed=True,
+                             color=color, thickness=thickness, lineType=cv2.LINE_AA)
+            elif shape_type == "line":
+                line_points = shape.get('line_points', None)
+                if line_points and len(line_points) >= 2:
+                    p1_rel, p2_rel = line_points[0], line_points[1]
+                    p1_new = (int(p1_rel[0] + nx), int(p1_rel[1] + ny))
+                    p2_new = (int(p2_rel[0] + nx), int(p2_rel[1] + ny))
+                    cv2.line(self.canvas, p1_new, p2_new,
+                            color, thickness, lineType=cv2.LINE_AA)
+                else:
+                    cv2.line(self.canvas, (int(nx - w//2), int(ny)), 
+                            (int(nx + w//2), int(ny)),
+                            color, thickness, lineType=cv2.LINE_AA)
+            elif shape_type == "freehand":
+                stroke_points = shape.get('stroke_points', [])
+                if stroke_points:
+                    orig_pos = shape.get('original_pos', (nx, ny))
+                    dx = nx - orig_pos[0]
+                    dy = ny - orig_pos[1]
+                    
+                    for i in range(1, len(stroke_points)):
+                        p1 = stroke_points[i-1]
+                        p2 = stroke_points[i]
+                        cv2.line(self.canvas,
+                                (int(p1[0] + dx), int(p1[1] + dy)),
+                                (int(p2[0] + dx), int(p2[1] + dy)),
+                                color, thickness, lineType=cv2.LINE_AA)
 
 
 # =============================================================================
@@ -1094,7 +1249,11 @@ def run(use_voice: bool = True):
     voice_last_timer = 0.0
     last_cnn_label   = ""
     last_cnn_conf    = 0.0
-    gesture_filter   = GestureTemporalFilter(window_size=11)  # FIX-12: Increased 9→11 for maximum gesture stability
+    gesture_filter   = GestureTemporalFilter(window_size=7)  # FIX-JHC: Reduced 11→7 to eliminate gesture ghosting (200ms window)
+    
+    # NEW: Temporal smoothing for frame gaps elimination
+    temporal_smoothers = {}  # Per-hand smoothing to interpolate missing frames
+    landmark_filters = {}     # Per-hand exponential filtering for jitter reduction
 
     def show_status(msg, dur=1.5):
         nonlocal status_msg, status_timer
@@ -1132,13 +1291,29 @@ def run(use_voice: bool = True):
 
         if result.hands:
             for hi, hand in enumerate(result.hands):
+                # NEW: Apply temporal smoothing to reduce frame gaps
+                hand_quality = _get_hand_quality(hand.landmarks)
+                
+                # Initialize smoothers for this hand if needed
+                if hi not in temporal_smoothers:
+                    temporal_smoothers[hi] = LandmarkTemporalSmoother(history_size=2)
+                    landmark_filters[hi] = ExponentialLandmarkFilter(alpha=0.15)
+                
+                # Smooth landmarks using temporal interpolation
+                smoothed_hand = temporal_smoothers[hi].smooth(hand, hand_quality, time.time())
+                if smoothed_hand is None:
+                    continue
+                
+                # Apply exponential filter to reduce jitter
+                smoothed_hand.landmarks = landmark_filters[hi].filter(smoothed_hand.landmarks)
+                
                 # FIX-5: Lowered threshold to 0.30
-                if _get_hand_quality(hand.landmarks) < _HAND_QUALITY_MIN:
+                if _get_hand_quality(smoothed_hand.landmarks) < _HAND_QUALITY_MIN:
                     continue
 
-                DrawLandmarks(frame, hand)
-                label = hand.label
-                lm    = hand.landmarks
+                DrawLandmarks(frame, smoothed_hand)
+                label = smoothed_hand.label
+                lm    = smoothed_hand.landmarks
 
                 rule_gesture = classify_gesture(lm, label)
 
@@ -1154,6 +1329,9 @@ def run(use_voice: bool = True):
                 if gesture == "open_palm" and last_cnn_conf < 0.90:
                     gesture = rule_gesture
 
+                # FIX-JHC: Apply temporal filter consistently
+                # Window size 7 = ~233ms at 30 FPS, good balance between stability and responsiveness
+                # No hard cutoff - all gestures filtered equally for consistency
                 gesture = gesture_filter.filter(gesture)
                 gesture_this_frame = gesture
                 # FIX-15: IMMEDIATE gesture-based start/stop (removed 2-3 second timing delays)
@@ -1166,7 +1344,7 @@ def run(use_voice: bool = True):
 
                 # FIX-16: Use correct finger position based on gesture
                 # thumbs_up: use thumb (0), others: use index (1)
-                tracking_finger = 0 if gesture == "thumbs_up" else 1
+                tracking_finger = 0 if gesture_this_frame == "thumbs_up" else 1
                 ix, iy      = fingertip_px(lm, FW, FH, finger=tracking_finger)
                 finger_cursor = (ix, iy)
                 was_prev    = ds.was_drawing.get(hi, False)
@@ -1194,9 +1372,20 @@ def run(use_voice: bool = True):
                         ds.was_drawing[hi]    = False
                         ds.pause_snapped[hi]  = False
                         ds._skip_first_draw[hi] = False
+                        continue  # Skip gesture handling when button is clicked
 
                 # ── Open palm → clear ────────────────────────────────────────
-                elif gesture == "open_palm":
+                if gesture_this_frame == "open_palm":
+                    # Reset shape positioning state when gesture changes
+                    if ds.is_moving_shape:
+                        # FIX-JHC: Rebuild canvas to ensure no artifacts from repositioning
+                        # This clears any lingering traces from shape movement
+                        ds.rebuild_all_shapes_on_canvas()
+                        ds.is_moving_shape = False
+                        ds.movement_controller.end_move()
+                        show_status("Shape released.", 1.5)
+                    ds.gesture_activator.reset()  # FIX: Reset when gesture changes
+                    
                     if not hasattr(ds, '_open_palm_streak'):
                         ds._open_palm_streak = 0; ds._open_palm_time = now
                     if now > ds._open_palm_time + 0.20:
@@ -1224,10 +1413,11 @@ def run(use_voice: bool = True):
 
                 # ── Sketch Position Control ──────────────────────────────────
                 # Closed thumbs_up gesture: grab and move shapes
-                elif gesture == "thumbs_up":
-                    # Update gesture activator for thumbs_up (show to grab shape)
+                elif gesture_this_frame == "thumbs_up":
+                    # Update gesture activator for thumbs_up (closed fist with thumb up)
+                    # CRITICAL: Must update on EVERY frame to track hold duration properly
                     is_activated = ds.gesture_activator.update(
-                        "thumbs_up", is_fist=False, current_time=now
+                        "thumbs_up", is_fist=True, current_time=now
                     )
                     progress = ds.gesture_activator.get_hold_progress(now)
                     
@@ -1236,10 +1426,13 @@ def run(use_voice: bool = True):
                         frame, ix, iy, progress
                     )
                     
-                    
-                    if gesture == "thumbs_up" and not ds.is_moving_shape:
-                        # Activation confirmed - start moving the most recent shape
-                        shape = ds.shape_tracker.get_most_recent()
+                    # FIX: Check is_activated (returns True when hold duration met), NOT gesture
+                    # is_activated is only True after holding for 2-3 seconds
+                    if is_activated and not ds.is_moving_shape:
+                        # FIX-JHC: Grab the shape NEAREST to hand position, not the most recent
+                        # This allows dynamic selection of ANY shape on screen based on hand proximity
+                        # Search radius: 120 pixels (allows grabbing shapes near hand)
+                        shape = ds.shape_tracker.get_nearest(ix, iy, radius=120)
                         
                         if shape:
                             ds.movement_controller.start_move(
@@ -1271,18 +1464,25 @@ def run(use_voice: bool = True):
                                     shape, new_pos[0], new_pos[1]
                                 )
                                 
-                                # Update shape position in tracker
-                                ds.shape_tracker.update_shape(shape['id'], {
-                                    'current_pos': final_pos,
-                                    'center': final_pos,
-                                    'moved': True
-                                })
-                                
-                                # FIX: Redraw shape at new position on canvas
-                                ds.redraw_shape_at_position(shape, old_pos)
+                                # Only redraw if position actually changed (performance optimization)
+                                if final_pos != old_pos:
+                                    # Store old position for redraw (update tracker before redraw)
+                                    old_pos_for_erase = old_pos
+                                    
+                                    # Update shape position in tracker
+                                    ds.shape_tracker.update_shape(shape['id'], {
+                                        'current_pos': final_pos,
+                                        'center': final_pos,
+                                        'moved': True
+                                    })
+                                    
+                                    # FIX-JHC: Redraw shape only when position changed (eliminates frame drops)
+                                    shape_updated = ds.shape_tracker.get_by_id(ds.current_moving_shape_id)
+                                    if shape_updated:
+                                        ds.redraw_shape_at_position(shape_updated, old_pos_for_erase)
 
                 # ── Erase ────────────────────────────────────────────────────
-                elif gesture == "erase":
+                elif gesture_this_frame == "erase":
                     # Hand opened while moving shape - release it
                     if ds.is_moving_shape:
                         ds.is_moving_shape = False
@@ -1302,12 +1502,19 @@ def run(use_voice: bool = True):
                     ds._skip_first_draw[hi] = False
 
                 # FIX-15: HARD STOP - block drawing if not in draw gesture
-                if gesture != "draw":
+                if gesture_this_frame != "draw":
                     ds.prev_x = None
                     ds.prev_y = None
 
                 # ── Draw ─────────────────────────────────────────────────────
-                elif gesture == "draw" and not button_action_taken:
+                elif gesture_this_frame == "draw" and not button_action_taken:
+                    # Reset shape positioning state when gesture changes from gesture like thumbs_up
+                    if ds.is_moving_shape:
+                        ds.is_moving_shape = False
+                        ds.movement_controller.end_move()
+                        show_status("Shape released.", 1.5)
+                    ds.gesture_activator.reset()  # FIX: Reset when gesture changes to draw
+                    
                     # FIX-15: Immediate gesture-based drawing (no timing delays)
                     # FIX-20: Eliminate drawing delay by removing threshold requirement
                     # Draw starts immediately with NO DISTANCE requirement
@@ -1399,6 +1606,8 @@ def run(use_voice: bool = True):
         # ── Release Shape on Gesture Change ──────────────────────────────
         # If we're moving a shape but gesture is no longer "thumbs_up", release it
         if gesture_this_frame != "thumbs_up" and ds.is_moving_shape:
+            # FIX-JHC: Finalize shape position on canvas before releasing
+            ds.rebuild_all_shapes_on_canvas()
             ds.is_moving_shape = False
             ds.movement_controller.end_move()
             if hasattr(ds, 'gesture_activator'):

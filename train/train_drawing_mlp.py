@@ -17,9 +17,15 @@ def main():
     
     # Flatten the image data for MLP
     n_samples = len(X_data)
-    X_data_flat = X_data.reshape((n_samples, -1))
+    X_data_flat = X_data.reshape((n_samples, -1)).astype(np.float32)
+    
+    # Normalize to 0-1 range but ensure no NaN
+    X_data_flat = X_data_flat / 255.0
+    X_data_flat = np.nan_to_num(X_data_flat, nan=0.0, posinf=1.0, neginf=0.0)
     
     print(f"Dataset created: {n_samples} samples")
+    print(f"Data range after norm: [{X_data_flat.min():.4f}, {X_data_flat.max():.4f}]")
+    print(f"NaN count: {np.isnan(X_data_flat).sum()}")
 
     # 2. Split data
     X_train, X_test, y_train, y_test = train_test_split(
@@ -30,14 +36,14 @@ def main():
 
     # 3. Initialize and Train MLPClassifier
     print("\nInitializing MLPClassifier...")
-    # These parameters are a good starting point for this kind of task
+    # Optimized hyperparameters for 20K clean dataset
     model = MLPClassifier(
         hidden_layer_sizes=(512, 256, 128),
         activation='relu',
         solver='adam',
-        max_iter=100, # More epochs than default
+        max_iter=100,
         random_state=1,
-        verbose=True, # This will print training progress
+        verbose=True,
         learning_rate_init=0.001,
         n_iter_no_change=10
     )

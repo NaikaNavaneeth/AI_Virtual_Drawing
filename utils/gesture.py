@@ -41,19 +41,27 @@ def fingers_up(hand_landmarks, hand_label: str) -> List[bool]:
     Returns [thumb, index, middle, ring, pinky] booleans.
     True = finger extended/up.
     Accounts for left/right hand mirror difference.
+    
+    FIX-22: Use extension depth instead of Y-coordinate comparison
+    to be robust to hand rotation. Depth is rotation-invariant.
     """
     lm = hand_landmarks.landmark
     result: List[bool] = []
 
-    # Thumb: compare x position relative to palm
+    # Thumb: compare x position relative to palm (this is rotation-robust)
     if hand_label == "Right":
         result.append(lm[4].x < lm[3].x)
     else:
         result.append(lm[4].x > lm[3].x)
 
-    # Index -> Pinky: tip.y < pip.y means extended
-    for tip, pip in [(8, 6), (12, 10), (16, 14), (20, 18)]:
-        result.append(lm[tip].y < lm[pip].y)
+    # FIX-22: Index -> Pinky: Use extension depth (not just Y comparison)
+    # Extension depth is rotation-invariant and works at any hand angle
+    finger_pairs = [(8, 5), (12, 9), (16, 13), (20, 17)]  # (tip, mcp)
+    for tip_idx, mcp_idx in finger_pairs:
+        depth = _finger_extension_depth(lm, tip_idx, mcp_idx)
+        # Finger is extended if depth > threshold (tip is above knuckle)
+        # Threshold of 0.01 is strict but tolerates slight hand rotations
+        result.append(depth > 0.01)
 
     return result
 

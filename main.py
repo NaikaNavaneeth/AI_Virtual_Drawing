@@ -191,7 +191,7 @@ def main():
         try:
             import subprocess
             result = subprocess.run(
-                [sys.executable, "train_gesture_cnn.py"],
+                [sys.executable, os.path.join("train", "train_gesture_cnn.py")],
                 cwd=os.path.dirname(os.path.abspath(__file__))
             )
         except Exception as e:

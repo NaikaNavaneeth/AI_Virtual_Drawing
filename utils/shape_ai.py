@@ -180,7 +180,7 @@ def detect_and_snap(
     
     # If we have 4 corners (eps=5) or slightly more, likely a rectangle/square
     if 4 <= corner_count <= 6 and ar < 4.0 and clos < 0.30:
-        return "rectangle", _make_rectangle(raw_pts)
+        return "square", _make_rectangle(raw_pts)
 
     # ── Circle detection (VERY strict threshold to avoid false positives) ────
     # After subsampling & considering actual metrics:
@@ -217,7 +217,7 @@ def sketch_to_3d(shape_name: str) -> Optional[Dict[str, Any]]:
             "color": (0.3, 0.6, 1.0),
             "scale": 1.0,
         },
-        "rectangle": {
+        "square": {
             "type":  "cube",
             "label": "Cube",
             "color": (1.0, 0.5, 0.2),
