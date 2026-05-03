@@ -51,9 +51,18 @@ def _validate_shape_match(raw_pts: List[Tuple[int, int]], detected_shape: str) -
         True if stroke properties match the detected shape, False otherwise
     """
     if not raw_pts or len(raw_pts) < 10:
+        print(f"[Validation] REJECT {detected_shape}: too few points ({len(raw_pts)})")
         return False
     
     pts_array = np.array(raw_pts, dtype=np.float32)
+    
+    # Calculate aspect ratio for all shapes
+    x_min, y_min = pts_array.min(axis=0)
+    x_max, y_max = pts_array.max(axis=0)
+    w = x_max - x_min
+    h = y_max - y_min
+    aspect = w / h if h > 0 else 1.0
+    print(f"[Validation] Checking {detected_shape}: {len(raw_pts)} pts, aspect={aspect:.2f}")
     
     # CIRCLE validation: Check if the stroke forms a closed loop
     if detected_shape == "circle":
@@ -107,6 +116,7 @@ def _validate_shape_match(raw_pts: List[Tuple[int, int]], detected_shape: str) -
     # SQUARE validation: Check for ~4 corners and rectangular aspect
     elif detected_shape == "square":
         if len(pts_array) < 5:
+            print(f"[Validation] REJECT square: too few points ({len(pts_array)})")
             return False
         
         # Count corners (similar to triangle logic)
@@ -129,26 +139,26 @@ def _validate_shape_match(raw_pts: List[Tuple[int, int]], detected_shape: str) -
                 if angle_deg < (180 - threshold_angle):
                     corners += 1
         
+        print(f"[Validation] Square check: {corners} corners, aspect={aspect:.2f}")
+        
         # Squares should have 4 corners
         if not (3 <= corners <= 5):
+            print(f"[Validation] REJECT square: only {corners} corners (need 3-5)")
             return False
         
         # Also check aspect ratio (should be roughly square-like)
-        x_min, y_min = pts_array.min(axis=0)
-        x_max, y_max = pts_array.max(axis=0)
-        w = x_max - x_min
-        h = y_max - y_min
-        aspect = w / h if h > 0 else 1.0
-        
         # Aspect ratio should be between 0.6 and 1.67 (allows some rectangles)
         if aspect < 0.6 or aspect > 1.67:
+            print(f"[Validation] REJECT square: aspect {aspect:.2f} out of range [0.6, 1.67]")
             return False
         
+        print(f"[Validation] ACCEPT square")
         return True
     
     # LINE validation: Check if points are roughly collinear
     elif detected_shape == "line":
         if len(pts_array) < 3:
+            print(f"[Validation] REJECT line: too few points ({len(pts_array)})")
             return False
         
         # Use least-squares to fit a line, check residuals
@@ -157,17 +167,21 @@ def _validate_shape_match(raw_pts: List[Tuple[int, int]], detected_shape: str) -
         try:
             m, c = np.linalg.lstsq(A, pts_array[:, 1], rcond=None)[0]
         except:
+            print(f"[Validation] REJECT line: lstsq failed")
             return False
         
         # Calculate distances from points to fitted line
         line_y = m * pts_array[:, 0] + c
         distances = np.abs(pts_array[:, 1] - line_y)
         
-        # At least 70% of points should be close to the line (within 10 units)
-        close_points = np.sum(distances < 10)
+        # Much stricter: 85% of points should be close to line (within 6 units)
+        # This rejects rough scribbles that aren't actually lines
+        close_points = np.sum(distances < 6)
         linearity = close_points / len(pts_array)
         
-        return linearity >= 0.7
+        print(f"[Validation] Line check: {linearity:.0%} linearity ({close_points}/{len(pts_array)} points < 6 units)")
+        
+        return linearity >= 0.85
     
     return False
 

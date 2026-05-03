@@ -653,9 +653,17 @@ class DrawingState:
         # Priority 1: rule-based geometric detector (most reliable)
         shape, clean_pts = detect_and_snap(self.current_stroke)
 
+        # FIX: Validate rule-based detections too (prevents rough sketches from snapping)
         if shape and clean_pts:
-            self._apply_shape_snap(shape, clean_pts, collab_client)
-        else:
+            from utils.shape_mlp_ai import _validate_shape_match
+            if not _validate_shape_match(self.current_stroke, shape):
+                print(f"[ShapeSnap] Rule-based shape '{shape}' failed validation - treating as freehand")
+                shape = None
+                clean_pts = None
+            else:
+                self._apply_shape_snap(shape, clean_pts, collab_client)
+
+        if not (shape and clean_pts):
             # Priority 2: MLP detector
             try:
                 shape, clean_pts = detect_and_snap_mlp(
@@ -1676,6 +1684,7 @@ def run(use_voice: bool = True):
 
                 # FIX-16: Use correct finger position based on gesture
                 # thumbs_up: use thumb (0), others: use index (1)
+                # Also use index for "fist" since we'll be grabbing with closed fist
                 tracking_finger = 0 if gesture_this_frame == "thumbs_up" else 1
                 ix, iy      = fingertip_px(lm, FW, FH, finger=tracking_finger)
                 finger_cursor = (ix, iy)
@@ -1752,12 +1761,14 @@ def run(use_voice: bool = True):
                     ds._skip_first_draw[hi] = True  # FIX-3: guard next draw start
 
                 # ── Sketch Position Control ──────────────────────────────────
-                # Closed thumbs_up gesture: grab and move shapes
-                elif gesture_this_frame == "thumbs_up":
-                    # Update gesture activator for thumbs_up (closed fist with thumb up)
+                # Closed fist or thumbs_up gesture: grab and move shapes
+                # FIX-ROUGH: Accept both "fist" (regular closed fist) and "thumbs_up" (fist with thumb up)
+                # This allows users to grab shapes with either gesture
+                elif gesture_this_frame in ("thumbs_up", "fist"):
+                    # Update gesture activator for grab gesture (closed fist or thumbs_up)
                     # CRITICAL: Must update on EVERY frame to track hold duration properly
                     is_activated = ds.gesture_activator.update(
-                        "thumbs_up", is_fist=True, current_time=now
+                        gesture_this_frame, is_fist=True, current_time=now
                     )
                     progress = ds.gesture_activator.get_hold_progress(now)
                     
