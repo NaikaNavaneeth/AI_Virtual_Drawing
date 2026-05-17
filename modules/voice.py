@@ -225,3 +225,25 @@ class VoiceCommandListener:
                         self._callback(action)
                     return
         print(f"[Voice] No command matched: '{text}'")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper function to print available commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+def print_commands(mode: str = "2d"):
+    """Print all available voice commands for the given mode."""
+    print("\n" + "="*80)
+    print(f"VOICE COMMANDS AVAILABLE ({mode.upper()} MODE)")
+    print("="*80)
+    
+    cmd_table = VOICE_COMMANDS_2D if mode == "2d" else VOICE_COMMANDS_3D
+    
+    for phrases, action in cmd_table:
+        # Group similar actions
+        example_phrase = phrases[0] if phrases else "N/A"
+        print(f"  • {example_phrase:40} → {action}")
+    
+    print("\n" + "="*80)
+    print("Tip: Speak naturally - the system matches keywords, not exact phrases.")
+    print("="*80 + "\n")

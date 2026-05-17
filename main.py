@@ -170,7 +170,7 @@ def main():
         print("Starting 2D Virtual Drawing Board ...")
         try:
             from modules.drawing_2d import run as run_2d
-            run_2d(use_voice=False)
+            run_2d(use_voice=True)
         except Exception as e:
             print(f"\nERROR: {e}")
             import traceback; traceback.print_exc()
