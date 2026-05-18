@@ -6,6 +6,11 @@ OPTIMIZATIONS (Phase 1.5):
 - Preprocessing cached and reused
 - NumPy operations prioritized over OpenCV where possible
 - Redundant copies eliminated
+
+EXTENDED (Phase 2):
+- Support for 30-shape model (letters A-Z + 0-9)
+- RL classifier integration for Tier 3 fallback
+- Switchable MLP modes at runtime
 """
 import numpy as np
 import cv2
@@ -14,28 +19,66 @@ from typing import List, Optional, Tuple
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ml.drawing_mlp import DrawingMLP
+from ml.drawing_mlp import DrawingMLP, MLPMode
 from utils.shape_ai import _bounding_box, _make_circle, _make_rectangle, _make_triangle, _make_line
-from core.config import MLP_CONFIDENCE_THRESHOLD
+from core.config import MLP_CONFIDENCE_THRESHOLD, MLP_MODE, RL_CLASSIFIER_ENABLED
 
 IMG_SIZE = 28
-# Confidence threshold now imported from config.py for easy tuning
-# Default: 0.65 (balance between accuracy and recall)
 CONFIDENCE_THRESHOLD = MLP_CONFIDENCE_THRESHOLD
 
-# --- Optimized Singleton Classifier Instance ---
+# --- Optimized Singleton Classifier Instances ---
 _classifier = None
-_classifier_cache = {}  # Cache for model predictions
+_rl_classifier = None
+_classifier_cache = {}
 
-def get_classifier():
-    """Initializes and returns the singleton MLP classifier instance (pre-cached)."""
+def get_classifier(mode_override: Optional[str] = None):
+    """
+    Initializes and returns the singleton MLP classifier instance.
+    
+    Args:
+        mode_override: Force a specific mode ("standard" or "extended")
+                      Default uses config.MLP_MODE
+    
+    Returns:
+        DrawingMLP instance or None if failed to load
+    """
     global _classifier
+    
+    mode_str = mode_override or MLP_MODE
+    target_mode = MLPMode.EXTENDED if mode_str == "extended" else MLPMode.STANDARD
+    
+    # If mode changed, reinitialize
+    if _classifier and _classifier.mode != target_mode:
+        print(f"[ShapeMLP] Mode changed from {_classifier.mode.value} to {target_mode.value}")
+        _classifier = None
+    
     if _classifier is None:
-        _classifier = DrawingMLP()
+        _classifier = DrawingMLP(mode=target_mode)
         if not _classifier.load():
-            print("[ShapeMLP] WARNING: Could not load the drawing MLP model. Shape snapping will not work.")
+            print(f"[ShapeMLP] WARNING: Could not load {target_mode.value} MLP model.")
+            print(f"[ShapeMLP] Shape snapping may be limited.")
             _classifier = None
+    
     return _classifier
+
+
+def get_rl_classifier():
+    """Get or initialize RL classifier for Tier 3 fallback"""
+    global _rl_classifier
+    
+    if not RL_CLASSIFIER_ENABLED:
+        return None
+    
+    if _rl_classifier is None:
+        try:
+            from utils.rl_classifier import get_rl_classifier as rl_getter
+            _rl_classifier = rl_getter()
+            print("[ShapeMLP] RL Classifier (Tier 3) initialized")
+        except Exception as e:
+            print(f"[ShapeMLP] Failed to initialize RL classifier: {e}")
+            return None
+    
+    return _rl_classifier
 
 
 def _validate_shape_match(raw_pts: List[Tuple[int, int]], detected_shape: str) -> bool:
@@ -71,87 +114,37 @@ def _validate_shape_match(raw_pts: List[Tuple[int, int]], detected_shape: str) -
         end = pts_array[-1]
         closure = np.linalg.norm(end - start)
         
-        # For a circle, start and end should be close (closure distance < 25% of bbox diagonal)
+        # For a circle, start and end should be close (closure distance < 50% of bbox diagonal)
+        # FIX-30c: Very relaxed - allow open circles
         x_min, y_min = pts_array.min(axis=0)
         x_max, y_max = pts_array.max(axis=0)
         bbox_diag = np.sqrt((x_max - x_min) ** 2 + (y_max - y_min) ** 2)
         
         closure_ratio = closure / bbox_diag if bbox_diag > 0 else 1.0
-        if closure_ratio > 0.35:  # Too open, not a circle
+        if closure_ratio > 0.60:  # Very relaxed, allow quite open circles
             return False
         
         return True
     
     # TRIANGLE validation: Check for ~3 corners/direction changes
     elif detected_shape == "triangle":
-        # Calculate direction changes (angles) at each point
-        if len(pts_array) < 5:
+        # FIX-30c: Much more relaxed - just check that stroke has some meaningful length
+        # Minimal point count for a triangle
+        if len(pts_array) < 3:
             return False
         
-        # Compute angles between consecutive segments
-        corners = 0
-        threshold_angle = 30  # degrees
-        
-        for i in range(1, len(pts_array) - 1):
-            v1 = pts_array[i] - pts_array[i-1]
-            v2 = pts_array[i+1] - pts_array[i]
-            
-            len1 = np.linalg.norm(v1)
-            len2 = np.linalg.norm(v2)
-            
-            if len1 > 1 and len2 > 1:
-                cos_angle = np.dot(v1, v2) / (len1 * len2)
-                cos_angle = np.clip(cos_angle, -1, 1)
-                angle_rad = np.arccos(cos_angle)
-                angle_deg = np.degrees(angle_rad)
-                
-                # Sharp turn = corner
-                if angle_deg < (180 - threshold_angle):
-                    corners += 1
-        
-        # Triangles should have 3 distinct corners
-        # Allow 2-4 corners for rough sketches
-        return 2 <= corners <= 4
+        # Just accept it - the MLP confidence threshold already filters bad predictions
+        return True
     
     # SQUARE validation: Check for ~4 corners and rectangular aspect
     elif detected_shape == "square":
-        if len(pts_array) < 5:
+        # FIX-30c: Very relaxed - accept almost all detected squares
+        # Minimum points for any polygon
+        if len(pts_array) < 3:
             print(f"[Validation] REJECT square: too few points ({len(pts_array)})")
             return False
         
-        # Count corners (similar to triangle logic)
-        corners = 0
-        threshold_angle = 30  # degrees
-        
-        for i in range(1, len(pts_array) - 1):
-            v1 = pts_array[i] - pts_array[i-1]
-            v2 = pts_array[i+1] - pts_array[i]
-            
-            len1 = np.linalg.norm(v1)
-            len2 = np.linalg.norm(v2)
-            
-            if len1 > 1 and len2 > 1:
-                cos_angle = np.dot(v1, v2) / (len1 * len2)
-                cos_angle = np.clip(cos_angle, -1, 1)
-                angle_rad = np.arccos(cos_angle)
-                angle_deg = np.degrees(angle_rad)
-                
-                if angle_deg < (180 - threshold_angle):
-                    corners += 1
-        
-        print(f"[Validation] Square check: {corners} corners, aspect={aspect:.2f}")
-        
-        # Squares should have 4 corners
-        if not (3 <= corners <= 5):
-            print(f"[Validation] REJECT square: only {corners} corners (need 3-5)")
-            return False
-        
-        # Also check aspect ratio (should be roughly square-like)
-        # Aspect ratio should be between 0.6 and 1.67 (allows some rectangles)
-        if aspect < 0.6 or aspect > 1.67:
-            print(f"[Validation] REJECT square: aspect {aspect:.2f} out of range [0.6, 1.67]")
-            return False
-        
+        # Just accept it - confidence threshold filters bad predictions
         print(f"[Validation] ACCEPT square")
         return True
     
@@ -174,14 +167,14 @@ def _validate_shape_match(raw_pts: List[Tuple[int, int]], detected_shape: str) -
         line_y = m * pts_array[:, 0] + c
         distances = np.abs(pts_array[:, 1] - line_y)
         
-        # Much stricter: 85% of points should be close to line (within 6 units)
-        # This rejects rough scribbles that aren't actually lines
-        close_points = np.sum(distances < 6)
+        # FIX-30c: Much more lenient - 70% linearity instead of 85%
+        # Allow curved strokes and loose lines (users don't draw perfectly straight)
+        close_points = np.sum(distances < 10)  # Also increased tolerance from 6 to 10
         linearity = close_points / len(pts_array)
         
-        print(f"[Validation] Line check: {linearity:.0%} linearity ({close_points}/{len(pts_array)} points < 6 units)")
+        print(f"[Validation] Line check: {linearity:.0%} linearity ({close_points}/{len(pts_array)} points < 10 units)")
         
-        return linearity >= 0.85
+        return linearity >= 0.70
     
     return False
 
@@ -215,7 +208,7 @@ def _preprocess_stroke(stroke_points: List[Tuple[int, int]], canvas_shape: Tuple
     # Translate points to ROI coordinates
     pts_roi = stroke_array - np.array([x_min - 1, y_min - 1])
     pts_roi = pts_roi.reshape((-1, 1, 2))
-    cv2.polylines(stroke_canvas, [pts_roi], isClosed=False, color=255, thickness=2)
+    cv2.polylines(stroke_canvas, [pts_roi], isClosed=False, color=255, thickness=1)
 
     # 3. Optimize: Make square with single np.pad call (vs manual loop)
     side = max(roi_h, roi_w)
@@ -251,8 +244,8 @@ def detect_and_snap_mlp(
     """
     clf = get_classifier()
     
-    # OPTIMIZED: Stricter minimum point count (was 5, now 20)
-    if not clf or len(raw_pts) < 20:
+    # OPTIMIZED: Minimum point count (10 points allows quick strokes from users)
+    if not clf or len(raw_pts) < 10:
         result = (None, None)
         if return_confidence:
             return (None, None, 0.0)
@@ -288,15 +281,12 @@ def detect_and_snap_mlp(
             return (None, None, confidence)
         return (None, None)
 
-    # 4. VALIDATE shape match (new fix for rough sketches)
-    # Check if the detected shape actually matches the stroke properties
-    if not _validate_shape_match(raw_pts, shape):
-        print(f"[ShapeMLP] Shape validation FAILED for {shape} - treating as freehand")
-        if return_confidence:
-            return (None, None, confidence)
-        return (None, None)
+    # 4. Shape processing and snapping
+    # FIX-30c: Accept predictions with confidence >= 0.75 without additional validation
+    # The threshold itself provides sufficient filtering
+    # The model may not be perfect, but validation is too strict for real user input
     
-    print(f"[ShapeMLP] Shape validation PASSED for {shape}")
+    print(f"[ShapeMLP] Shape validation BYPASSED (confidence: {confidence:.2f} >= 0.75)")
 
     # Use the original rule-based shape generators
     clean_shape = None

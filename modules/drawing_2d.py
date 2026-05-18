@@ -66,7 +66,8 @@ from core.config import (
 from utils.mp_compat import HandTracker, DrawLandmarks, HAND_CONNECTIONS
 from utils.gesture import fingers_up, classify_gesture, fingertip_px
 from utils.shape_ai import sketch_to_3d, stroke_size, detect_and_snap
-from utils.shape_mlp_ai import detect_and_snap_mlp
+from utils.shape_mlp_ai import detect_and_snap_mlp, get_rl_classifier
+from utils.rl_classifier import RLFeatureExtractor
 from utils.shape_fitting import fit_circle, fit_rectangle, fit_triangle, fit_line
 from utils.temporal_smooth import LandmarkTemporalSmoother, ExponentialLandmarkFilter
 from modules.sketch_position_control import (
@@ -631,87 +632,198 @@ class DrawingState:
         cv2.circle(self.canvas, (x, y), self.eraser_r, (0, 0, 0), -1)
         self.reset_stroke()
 
+    def _is_valid_shape_stroke(self, stroke_pts: List[Tuple[int, int]]) -> bool:
+        """
+        FIX-29: Validate that a stroke is realistic for shape detection.
+        Reject strokes that are too sparse, too scattered, or geometrically invalid.
+        
+        FIX-30b: Relaxed thresholds to allow geometric shapes with few points
+        (squares, triangles often drawn with only corner points)
+        
+        Returns True only if stroke passes all sanity checks.
+        """
+        if not stroke_pts or len(stroke_pts) < 3:  # Relaxed from 5 to 3 (triangle minimum)
+            return False
+        
+        # Check 1: Stroke must have reasonable spread (not a single point)
+        xs = [p[0] for p in stroke_pts]
+        ys = [p[1] for p in stroke_pts]
+        x_spread = max(xs) - min(xs)
+        y_spread = max(ys) - min(ys)
+        
+        # Minimum spread of 15 pixels (relaxed from 20)
+        if x_spread < 15 or y_spread < 15:
+            return False
+        
+        # Check 2: Stroke must be reasonably continuous (not wildly scattered)
+        # Calculate average distance between consecutive points
+        distances = []
+        for i in range(1, len(stroke_pts)):
+            dx = stroke_pts[i][0] - stroke_pts[i-1][0]
+            dy = stroke_pts[i][1] - stroke_pts[i-1][1]
+            dist = math.hypot(dx, dy)
+            distances.append(dist)
+        
+        if not distances:
+            return False
+        
+        avg_dist = sum(distances) / len(distances)
+        max_dist = max(distances)
+        
+        # FIX-30b: Very relaxed thresholds for geometric shapes
+        # Real shapes often drawn with sparse points (corners only)
+        # Threshold: 100 pixels average (very generous for corner-based shapes)
+        if avg_dist > 100:
+            return False
+        
+        # No single gap should be > 150 pixels
+        if max_dist > 150:
+            return False
+        
+        # Check 3: Stroke must be mostly continuous (not pure random jumps)
+        # Count gaps > 75 pixels
+        large_gaps = sum(1 for d in distances if d > 75)
+        # Allow up to 60% large gaps (very tolerant of sparse geometric shapes)
+        if large_gaps > len(distances) * 0.6:
+            return False
+        
+        # Check 4: Bounding box area should be reasonable
+        bbox_area = x_spread * y_spread
+        # Minimum 300 pixels² (relaxed from 400)
+        if bbox_area < 300:
+            return False
+        
+        aspect_ratio = max(x_spread, y_spread) / (min(x_spread, y_spread) + 1)
+        # Allow up to 20:1 aspect ratio (relaxed from 15)
+        if aspect_ratio > 20:
+            return False
+        
+        # All checks passed
+        return True
+
     def try_snap_shape(self, collab_client=None):
         """
-        On stroke end: try unified shape snapping with fallback chain.
+        On stroke end: try unified shape snapping with 3-tier fallback chain.
         
-        Detection priority (FIX-24: Added RL-based universal classifier):
+        Detection priority (UPDATED: Tier 3 RL Classifier):
         1. Rule-based geometric detector (highest reliability)
-        2. MLP shape classifier
-        3. RL-based universal classifier (can handle any shape/letter)
+        2. MLP shape classifier (4 or 30 shapes based on config)
+        3. RL-based universal classifier (learns unlimited shapes) **NEW**
         4. Legacy letter snapper (fallback)
         5. Freehand registration (last resort)
+        
+        FIX-29: Add stroke validation to prevent false shape transformations
         """
         if not self.snap_active or len(self.current_stroke) < _MIN_SNAP_PTS:
             self.current_stroke.clear()
             self._stroke_buf_for_smooth.clear()
             return
 
-        shape     = None
-        clean_pts = None
+        # FIX-29: Validate stroke BEFORE shape detection
+        # Reject unrealistic strokes (too sparse, too scattered, too small)
+        if not self._is_valid_shape_stroke(self.current_stroke):
+            print(f"[Shape] Stroke validation failed - registering as freehand")
+            self._register_freehand_stroke(collab_client)
+            self.current_stroke.clear()
+            self._stroke_buf_for_smooth.clear()
+            return
 
-        # Priority 1: rule-based geometric detector (most reliable)
+        shape = None
+        clean_pts = None
+        detected_category = None  # Track what category was detected
+        detected_confidence = 0.0  # Track confidence for feedback
+
+        # ────────────────────────────────────────────────────────────────────────
+        # TIER 1: Rule-based geometric detector (most reliable)
+        # ────────────────────────────────────────────────────────────────────────
         shape, clean_pts = detect_and_snap(self.current_stroke)
 
-        # FIX: Validate rule-based detections too (prevents rough sketches from snapping)
         if shape and clean_pts:
             from utils.shape_mlp_ai import _validate_shape_match
             if not _validate_shape_match(self.current_stroke, shape):
-                print(f"[ShapeSnap] Rule-based shape '{shape}' failed validation - treating as freehand")
+                print(f"[Tier1] Rule-based shape '{shape}' failed validation - trying Tier 2")
                 shape = None
                 clean_pts = None
             else:
                 self._apply_shape_snap(shape, clean_pts, collab_client)
+                print(f"[Tier1] ✓ Rule-based SNAPPED: {shape}")
 
+        # ────────────────────────────────────────────────────────────────────────
+        # TIER 2: MLP shape classifier (4 or 30 shapes)
+        # ────────────────────────────────────────────────────────────────────────
         if not (shape and clean_pts):
-            # Priority 2: MLP detector
             try:
-                shape, clean_pts = detect_and_snap_mlp(
-                    self.current_stroke, (self.h, self.w))
+                shape, clean_pts = detect_and_snap_mlp(self.current_stroke, (self.h, self.w))
                 if shape and clean_pts:
                     self._apply_shape_snap(shape, clean_pts, collab_client)
-                else:
-                    # Priority 3: RL-based universal classifier (NEW FIX-24)
-                    rl_result = self._detect_shape_with_rl()
-                    if rl_result:
-                        category, label, confidence = rl_result
-                        # For RL-detected shapes, convert to standard format
-                        if category == "shapes":
-                            self._apply_shape_snap(label, self.current_stroke, collab_client)
-                            # Show prediction for feedback
-                            try:
-                                pred = self.universal_classifier.classify(self.current_stroke)
-                                self._show_rl_feedback(pred)
-                            except:
-                                pass
-                        shape = label  # Mark as snapped
-                    else:
-                        # Priority 4: Legacy letter snapping (fallback)
-                        result = _snap_to_letter(
-                            self.current_stroke, (self.h, self.w),
-                            self.color, self.thickness)
-                        if result:
-                            letter, patch = result
-                            if patch is not None:
-                                self._apply_letter_snap(letter, patch)
-                        # FIX-21: Ensure shape is reset for freehand registration
-                        shape = None
+                    detected_category = "mlp_shape"
+                    detected_confidence = 0.7  # Approximate
+                    print(f"[Tier2] ✓ MLP SNAPPED: {shape}")
             except Exception as e:
-                print(f"[Shape] Detection failed: {e}")
-                result = _snap_to_letter(
-                    self.current_stroke, (self.h, self.w),
-                    self.color, self.thickness)
+                print(f"[Tier2] MLP detection error: {e}")
+                shape = None
+
+        # ────────────────────────────────────────────────────────────────────────
+        # TIER 3: RL-based universal classifier (learns any shape/letter)
+        # ────────────────────────────────────────────────────────────────────────
+        if not (shape and clean_pts):
+            try:
+                rl_clf = get_rl_classifier()
+                if rl_clf:
+                    rl_result = rl_clf.classify(self.current_stroke, return_alternatives=True)
+                    
+                    if rl_result and rl_result.confidence > 0.75:  # High confidence threshold
+                        detected_label = rl_result.label
+                        detected_category = rl_result.category
+                        detected_confidence = rl_result.confidence
+                        
+                        print(f"[Tier3] ✓ RL RECOGNIZED: {detected_label} "
+                              f"({detected_category}, conf={detected_confidence:.2f})")
+                        
+                        # For RL-detected shapes, apply shape snap using original stroke
+                        if detected_category in ["shape", "letter", "number"]:
+                            self._apply_shape_snap(detected_label, self.current_stroke, collab_client)
+                            shape = detected_label
+                        else:
+                            print(f"[Tier3] Category '{detected_category}' not snap-compatible, registering as freehand")
+                    else:
+                        print(f"[Tier3] RL confidence too low, trying legacy letter snapper")
+            except Exception as e:
+                print(f"[Tier3] RL detection error: {e}")
+
+        # ────────────────────────────────────────────────────────────────────────
+        # TIER 4: Legacy letter snapping (fallback)
+        # ────────────────────────────────────────────────────────────────────────
+        if shape is None:
+            try:
+                result = _snap_to_letter(self.current_stroke, (self.h, self.w),
+                                        self.color, self.thickness)
                 if result:
                     letter, patch = result
                     if patch is not None:
                         self._apply_letter_snap(letter, patch)
-                # FIX-21: Ensure shape is reset for freehand registration
-                shape = None
+                        print(f"[Tier4] ✓ LETTER SNAPPED: {letter}")
+                        shape = letter
+            except Exception as e:
+                print(f"[Tier4] Letter snapping error: {e}")
 
-        # FIX-17: Register freehand stroke BEFORE clearing buffers
-        # If no shape was snapped, register the freehand stroke for movement
+        # ────────────────────────────────────────────────────────────────────────
+        # TIER 5: Freehand registration (last resort)
+        # ────────────────────────────────────────────────────────────────────────
         if shape is None:
+            # Extract features for RL learning (if not detected above)
+            try:
+                if detected_category is None:
+                    features = RLFeatureExtractor.extract(self.current_stroke)
+                    rl_clf = get_rl_classifier()
+                    if rl_clf and features:
+                        # Store for potential future learning
+                        pass
+            except:
+                pass
+            
             self._register_freehand_stroke(collab_client)
+            print(f"[Tier5] ✓ FREEHAND REGISTERED: {len(self.current_stroke)} points")
         
         self.current_stroke.clear()
         self._stroke_buf_for_smooth.clear()

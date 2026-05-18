@@ -120,12 +120,36 @@ CNN_INPUT_SIZE    = 63          # 21 landmarks × 3 (x,y,z), normalized
 CNN_CONFIDENCE    = 0.85        # CNN gesture confidence threshold
 
 # ─────────────────────────────────────────────
-# MLP Shape Detection Model
+# MLP Shape Detection Model (Tier 2)
 # ─────────────────────────────────────────────
 MLP_MODEL_PATH           = os.path.join(MODEL_DIR_ML, "drawing_mlp.pkl")
-MLP_CONFIDENCE_THRESHOLD = 0.65  # Tunable: Higher=fewer detections, Lower=more detections
+MLP_MODEL_PATH_EXTENDED  = os.path.join(MODEL_DIR_ML, "drawing_mlp_30.pkl")
+MLP_CONFIDENCE_THRESHOLD = 0.75  # FIX-29: INCREASED 0.65→0.75 to prevent false positives
+                                 # Only accept high-confidence predictions from MLP
                                  # Range: 0.55-0.75 recommended
-                                 # 0.65 = balance between accuracy and recall
+                                 # 0.75 = strict (fewer false positives, some false negatives)
+
+# MLP Mode Selection
+# Options: "standard" (4 shapes) or "extended" (30 shapes: A-Z + 0-9)
+MLP_MODE = "standard"  # FIX-30: Revert to standard mode (extended model missing)
+                       # To enable letters, train extended model with:
+                       # python ml/train_drawing_mlp_extended.py
+
+# ─────────────────────────────────────────────
+# RL Classifier Configuration (Tier 3)
+# ─────────────────────────────────────────────
+RL_CLASSIFIER_ENABLED   = False  # FIX-29: Disabled by default to prevent false positives
+                                 # Enable when you have trained the RL classifier with user feedback
+                                 # For now, rely on Tier 1 (rule-based) and Tier 2 (MLP)
+RL_CONFIDENCE_THRESHOLD = 0.75   # High threshold for RL predictions
+RL_STORAGE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 
+                                "assets", "rl_knowledge.json")
+
+# ─────────────────────────────────────────────
+# Detection Pipeline (Tier Ordering)
+# ─────────────────────────────────────────────
+# Priority order: Rule-Based → MLP → RL → Freehand
+# Fallback enabled if each tier fails
 CNN_HIDDEN_SIZES  = [256, 128, 64]
 CNN_DROPOUT       = 0.3
 CNN_CONFIDENCE    = 0.85        # OPTIMIZED: Increased from 0.70 for stricter gesture recognition

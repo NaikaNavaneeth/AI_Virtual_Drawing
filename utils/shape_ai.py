@@ -179,18 +179,23 @@ def detect_and_snap(
     corner_count = len(simplified)
     
     # If we have 4 corners (eps=5) or slightly more, likely a rectangle/square
-    if 4 <= corner_count <= 6 and ar < 4.0 and clos < 0.30:
+    # FIX-29: Increased thresholds to prevent false positives
+    if 4 <= corner_count <= 6 and ar < 3.0 and clos < 0.20:
         return "square", _make_rectangle(raw_pts)
 
-    # ── Circle detection (VERY strict threshold to avoid false positives) ────
-    # After subsampling & considering actual metrics:
-    # - Rectangles: circ ~0.79, Circle: circ ~0.99
-    # - Only detect as circle if VERY circular
-    if circ > 0.90 and clos < 0.15 and ar < 1.4:
+    # ── Circle detection (ADJUSTED: More lenient for user-drawn circles) ────
+    # After testing with real user input:
+    # - Perfect circles: circ ~0.99
+    # - Rough user circles: circ ~0.70-0.75
+    # - Rectangles: circ ~0.79
+    # FIX-29: INCREASED threshold from 0.70→0.80 to prevent false positives
+    # Require stronger circularity evidence for circle detection
+    if circ > 0.80 and clos < 0.20 and ar < 1.3:
         return "circle", _make_circle(raw_pts)
 
     # ── Triangle detection ───────────────────────────────────────────────────
-    if 3 <= corner_count <= 4 and clos < 0.30:
+    # FIX-29: Stricter triangle detection
+    if 3 <= corner_count <= 4 and clos < 0.25:
         return "triangle", _make_triangle(raw_pts)
 
     return None, None

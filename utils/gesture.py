@@ -60,8 +60,10 @@ def fingers_up(hand_landmarks, hand_label: str) -> List[bool]:
     for tip_idx, mcp_idx in finger_pairs:
         depth = _finger_extension_depth(lm, tip_idx, mcp_idx)
         # Finger is extended if depth > threshold (tip is above knuckle)
-        # Threshold of 0.01 is strict but tolerates slight hand rotations
-        result.append(depth > 0.01)
+        # FIX-28: Increased threshold from 0.01→0.04 to prevent false positives
+        # When hand is at rest, fingers should NOT be detected as extended
+        # 0.04 threshold eliminates jittery MediaPipe noise at rest
+        result.append(depth > 0.04)
 
     return result
 
@@ -98,16 +100,29 @@ def classify_gesture(hand_landmarks, hand_label: str) -> str:
 
     # -- Draw: only index finger up (thumb must be down) ----------------------
     # FIX-18: Explicitly require thumb to be down to prevent confusion with thumbs_up
+    # FIX-28: Add extra validation - index DEPTH must be significant (0.08+)
+    # This prevents false draws when hand is resting/moving
     if index and not thumb and not middle and not ring and not pinky:
-        return "draw"
+        index_depth = _finger_extension_depth(lm, 8, 5)
+        if index_depth > 0.08:  # FIX-28: Index must be CLEARLY extended
+            return "draw"
 
     # -- Erase: index + middle up ---------------------------------------------
+    # FIX-28: Require both index AND middle to be clearly extended
     if index and middle and not ring and not pinky:
-        return "erase"
+        index_depth = _finger_extension_depth(lm, 8, 5)
+        middle_depth = _finger_extension_depth(lm, 12, 9)
+        if index_depth > 0.05 and middle_depth > 0.05:  # Both must be extended
+            return "erase"
 
     # -- Select: index + middle + ring up -------------------------------------
+    # FIX-28: Require all three fingers to be clearly extended
     if index and middle and ring and not pinky:
-        return "select"
+        i_depth = _finger_extension_depth(lm, 8, 5)
+        m_depth = _finger_extension_depth(lm, 12, 9)
+        r_depth = _finger_extension_depth(lm, 16, 13)
+        if i_depth > 0.05 and m_depth > 0.05 and r_depth > 0.05:
+            return "select"
 
     # -- Open palm (CLEAR) -- robust multi-condition check --------------------
     # Condition 1: basic fingers_up says all fingers up
@@ -153,8 +168,11 @@ def classify_gesture(hand_landmarks, hand_label: str) -> str:
         return "fist"
 
     # -- Thumbs up ------------------------------------------------------------
+    # FIX-28: Add extra validation - thumb DEPTH must be significant (0.06+)
     if thumb and not index and not middle and not ring and not pinky:
-        return "thumbs_up"
+        thumb_depth = _finger_extension_depth(lm, 4, 2)  # Use PIP instead of MCP for thumb
+        if thumb_depth > 0.06:
+            return "thumbs_up"
 
     # -- Pinch: thumb and index tips close, others down -----------------------
     tip_thumb = (lm[4].x, lm[4].y)
