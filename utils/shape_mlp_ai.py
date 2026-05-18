@@ -40,150 +40,23 @@ def get_classifier():
 
 def _validate_shape_match(raw_pts: List[Tuple[int, int]], detected_shape: str) -> bool:
     """
-    Validate that the detected shape actually matches the stroke characteristics.
-    This prevents false positives where rough sketches are incorrectly classified as shapes.
+    FIX-31b: Simplified validation - just basic sanity checks, don't reject valid shapes.
+    The model confidence threshold is the main gatekeeper now.
     
     Args:
         raw_pts: The original stroke points
         detected_shape: The shape detected by MLP ("circle", "square", "triangle", "line")
     
     Returns:
-        True if stroke properties match the detected shape, False otherwise
+        True if stroke seems reasonable for this shape, False only for obvious rejects
     """
-    if not raw_pts or len(raw_pts) < 10:
-        print(f"[Validation] REJECT {detected_shape}: too few points ({len(raw_pts)})")
+    # Only check absolute minimum
+    if not raw_pts or len(raw_pts) < 3:
         return False
     
-    pts_array = np.array(raw_pts, dtype=np.float32)
-    
-    # Calculate aspect ratio for all shapes
-    x_min, y_min = pts_array.min(axis=0)
-    x_max, y_max = pts_array.max(axis=0)
-    w = x_max - x_min
-    h = y_max - y_min
-    aspect = w / h if h > 0 else 1.0
-    print(f"[Validation] Checking {detected_shape}: {len(raw_pts)} pts, aspect={aspect:.2f}")
-    
-    # CIRCLE validation: Check if the stroke forms a closed loop
-    if detected_shape == "circle":
-        # Calculate distance from first to last point
-        start = pts_array[0]
-        end = pts_array[-1]
-        closure = np.linalg.norm(end - start)
-        
-        # For a circle, start and end should be close (closure distance < 25% of bbox diagonal)
-        x_min, y_min = pts_array.min(axis=0)
-        x_max, y_max = pts_array.max(axis=0)
-        bbox_diag = np.sqrt((x_max - x_min) ** 2 + (y_max - y_min) ** 2)
-        
-        closure_ratio = closure / bbox_diag if bbox_diag > 0 else 1.0
-        if closure_ratio > 0.35:  # Too open, not a circle
-            return False
-        
-        return True
-    
-    # TRIANGLE validation: Check for ~3 corners/direction changes
-    elif detected_shape == "triangle":
-        # Calculate direction changes (angles) at each point
-        if len(pts_array) < 5:
-            return False
-        
-        # Compute angles between consecutive segments
-        corners = 0
-        threshold_angle = 30  # degrees
-        
-        for i in range(1, len(pts_array) - 1):
-            v1 = pts_array[i] - pts_array[i-1]
-            v2 = pts_array[i+1] - pts_array[i]
-            
-            len1 = np.linalg.norm(v1)
-            len2 = np.linalg.norm(v2)
-            
-            if len1 > 1 and len2 > 1:
-                cos_angle = np.dot(v1, v2) / (len1 * len2)
-                cos_angle = np.clip(cos_angle, -1, 1)
-                angle_rad = np.arccos(cos_angle)
-                angle_deg = np.degrees(angle_rad)
-                
-                # Sharp turn = corner
-                if angle_deg < (180 - threshold_angle):
-                    corners += 1
-        
-        # Triangles should have 3 distinct corners
-        # Allow 2-4 corners for rough sketches
-        return 2 <= corners <= 4
-    
-    # SQUARE validation: Check for ~4 corners and rectangular aspect
-    elif detected_shape == "square":
-        if len(pts_array) < 5:
-            print(f"[Validation] REJECT square: too few points ({len(pts_array)})")
-            return False
-        
-        # Count corners (similar to triangle logic)
-        corners = 0
-        threshold_angle = 30  # degrees
-        
-        for i in range(1, len(pts_array) - 1):
-            v1 = pts_array[i] - pts_array[i-1]
-            v2 = pts_array[i+1] - pts_array[i]
-            
-            len1 = np.linalg.norm(v1)
-            len2 = np.linalg.norm(v2)
-            
-            if len1 > 1 and len2 > 1:
-                cos_angle = np.dot(v1, v2) / (len1 * len2)
-                cos_angle = np.clip(cos_angle, -1, 1)
-                angle_rad = np.arccos(cos_angle)
-                angle_deg = np.degrees(angle_rad)
-                
-                if angle_deg < (180 - threshold_angle):
-                    corners += 1
-        
-        print(f"[Validation] Square check: {corners} corners, aspect={aspect:.2f}")
-        
-        # Squares should have 4 corners
-        if not (3 <= corners <= 5):
-            print(f"[Validation] REJECT square: only {corners} corners (need 3-5)")
-            return False
-        
-        # Also check aspect ratio (should be roughly square-like)
-        # Aspect ratio should be between 0.6 and 1.67 (allows some rectangles)
-        if aspect < 0.6 or aspect > 1.67:
-            print(f"[Validation] REJECT square: aspect {aspect:.2f} out of range [0.6, 1.67]")
-            return False
-        
-        print(f"[Validation] ACCEPT square")
-        return True
-    
-    # LINE validation: Check if points are roughly collinear
-    elif detected_shape == "line":
-        if len(pts_array) < 3:
-            print(f"[Validation] REJECT line: too few points ({len(pts_array)})")
-            return False
-        
-        # Use least-squares to fit a line, check residuals
-        # If most points are close to the line, it's a valid line
-        A = np.vstack([pts_array[:, 0], np.ones(len(pts_array))]).T
-        try:
-            m, c = np.linalg.lstsq(A, pts_array[:, 1], rcond=None)[0]
-        except:
-            print(f"[Validation] REJECT line: lstsq failed")
-            return False
-        
-        # Calculate distances from points to fitted line
-        line_y = m * pts_array[:, 0] + c
-        distances = np.abs(pts_array[:, 1] - line_y)
-        
-        # Much stricter: 85% of points should be close to line (within 6 units)
-        # This rejects rough scribbles that aren't actually lines
-        close_points = np.sum(distances < 6)
-        linearity = close_points / len(pts_array)
-        
-        print(f"[Validation] Line check: {linearity:.0%} linearity ({close_points}/{len(pts_array)} points < 6 units)")
-        
-        return linearity >= 0.85
-    
-    return False
+    # Accept the detection - the model and confidence threshold are the main validators now
+    print(f"[Validation] Accepting {detected_shape} (simplified validation)")
+    return True
 
 
 def _preprocess_stroke(stroke_points: List[Tuple[int, int]], canvas_shape: Tuple[int, int]) -> Optional[np.ndarray]:
@@ -238,7 +111,7 @@ def detect_and_snap_mlp(
 ) -> Tuple[Optional[str], Optional[List[Tuple[int, int]]], float]:
     """
     Uses the trained MLP to classify a stroke and return a clean version.
-    OPTIMIZED: Enhanced validation to reject malformed strokes early.
+    FIX-31b: Reduced validation strictness to allow real user-drawn shapes.
     
     Args:
         raw_pts: Stroke points
@@ -251,21 +124,21 @@ def detect_and_snap_mlp(
     """
     clf = get_classifier()
     
-    # OPTIMIZED: Stricter minimum point count (was 5, now 20)
-    if not clf or len(raw_pts) < 20:
+    # FIX-31b: Reduced from 20 to 5 minimum points (allow quick strokes)
+    if not clf or len(raw_pts) < 5:
         result = (None, None)
         if return_confidence:
             return (None, None, 0.0)
         return result
     
-    # OPTIMIZED: Validate aspect ratio (reject extreme ratios)
+    # FIX-31b: Much more lenient aspect ratio (allow diverse shape orientations)
     x_min, y_min, x_max, y_max = _bounding_box(raw_pts)
     w = max(x_max - x_min, 1)
     h = max(y_max - y_min, 1)
     aspect = w / h if h > 0 else 1.0
     
-    # Reject extreme aspect ratios (too elongated or too thin)
-    if aspect > 5.0 or aspect < 0.2:
+    # Reject only EXTREME aspect ratios
+    if aspect > 10.0 or aspect < 0.1:
         if return_confidence:
             return (None, None, 0.0)
         return (None, None)
@@ -288,15 +161,9 @@ def detect_and_snap_mlp(
             return (None, None, confidence)
         return (None, None)
 
-    # 4. VALIDATE shape match (new fix for rough sketches)
-    # Check if the detected shape actually matches the stroke properties
-    if not _validate_shape_match(raw_pts, shape):
-        print(f"[ShapeMLP] Shape validation FAILED for {shape} - treating as freehand")
-        if return_confidence:
-            return (None, None, confidence)
-        return (None, None)
-    
-    print(f"[ShapeMLP] Shape validation PASSED for {shape}")
+    # 4. FIX-31b: SKIP strict validation - Tier 1 is now lenient, just use MLP result
+    # The model is good enough; don't reject valid shapes with strict validation
+    print(f"[ShapeMLP] Using detected {shape} (confidence {confidence:.2f})")
 
     # Use the original rule-based shape generators
     clean_shape = None

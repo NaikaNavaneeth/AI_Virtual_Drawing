@@ -150,15 +150,15 @@ def _rdp_simplify(pts, epsilon: float):
 
 def detect_and_snap(
     raw_pts: List[Point],
-    min_points: int = 12,
+    min_points: int = 5,  # FIX-31: Reduced from 12 to allow quick strokes
     confidence_threshold: float = 0.55,
 ) -> Tuple[Optional[str], Optional[List[Point]]]:
     """
     Analyse raw_pts and attempt to classify + clean the shape.
     Returns (shape_name, clean_points) or (None, None).
     
-    OPTIMIZED: Better thresholds to prevent rectangle→circle misclassification.
-    KEY FIX: Circle threshold now 0.90+ (subsampling makes rectangles look circular).
+    FIX-31: Relaxed thresholds for user-drawn shapes (lower min points, more lenient detection)
+    Real user shapes are often rough and sparse - must be forgiving to catch valid shapes.
     """
     if len(raw_pts) < min_points:
         return None, None
@@ -170,7 +170,8 @@ def detect_and_snap(
     clos = _closure_ratio(sub)
 
     # ── Line detection (straightness wins) ───────────────────────────────────
-    if strt > 0.88:
+    # FIX-31: Relaxed from 0.88 to 0.75 to catch user-drawn lines
+    if strt > 0.75:
         return "line", _make_line(raw_pts)
 
     # ── Try to detect corners (indicates rectangle) ──────────────────────────
@@ -178,20 +179,20 @@ def detect_and_snap(
     simplified = _rdp_simplify(sub, epsilon=5)  # Tighter epsilon for corner detection
     corner_count = len(simplified)
     
-    # If we have 4 corners (eps=5) or slightly more, likely a rectangle/square
-    if 4 <= corner_count <= 6 and ar < 4.0 and clos < 0.30:
-        return "square", _make_rectangle(raw_pts)
+    # If we have 3-6 corners, likely a rectangle/square/triangle
+    # FIX-31: Relaxed closure threshold 0.30→0.35 to allow open shapes
+    if 3 <= corner_count <= 6 and ar < 4.0 and clos < 0.35:
+        # Distinguish between rectangles (4 corners) and triangles (3 corners)
+        if corner_count == 4 or (corner_count == 5 and ar < 1.5):
+            return "square", _make_rectangle(raw_pts)
+        elif 3 <= corner_count <= 4:
+            return "triangle", _make_triangle(raw_pts)
 
-    # ── Circle detection (VERY strict threshold to avoid false positives) ────
-    # After subsampling & considering actual metrics:
-    # - Rectangles: circ ~0.79, Circle: circ ~0.99
-    # - Only detect as circle if VERY circular
-    if circ > 0.90 and clos < 0.15 and ar < 1.4:
+    # ── Circle detection (ADJUSTED: Much more lenient for user-drawn circles) ────
+    # FIX-31: Drastically relaxed from 0.90 to 0.65 for user input
+    # User-drawn circles are often irregular but should still snap
+    if circ > 0.65 and clos < 0.40 and ar < 1.5:
         return "circle", _make_circle(raw_pts)
-
-    # ── Triangle detection ───────────────────────────────────────────────────
-    if 3 <= corner_count <= 4 and clos < 0.30:
-        return "triangle", _make_triangle(raw_pts)
 
     return None, None
 
